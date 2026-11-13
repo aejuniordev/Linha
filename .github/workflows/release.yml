@@ -87,6 +87,11 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Compilar
+        # IDs dos apps OAuth embutidos no executável (veja docs/OAUTH.md)
+        env:
+          LINHA_OUTLOOK_CLIENT_ID: ${{ secrets.LINHA_OUTLOOK_CLIENT_ID }}
+          LINHA_GOOGLE_CLIENT_ID: ${{ secrets.LINHA_GOOGLE_CLIENT_ID }}
+          LINHA_GOOGLE_CLIENT_SECRET: ${{ secrets.LINHA_GOOGLE_CLIENT_SECRET }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Empacotar (Linux/macOS)
@@ -96,7 +101,7 @@ jobs:
           NAME="${BIN_NAME}-${{ needs.prepare.outputs.tag }}-${{ matrix.target }}"
           mkdir -p "dist/$NAME"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/$NAME/"
-          cp README.md config.example.toml "dist/$NAME/"
+          cp README.md "dist/$NAME/"
           cp assets/fonts/LICENSE-Inter.txt "dist/$NAME/"
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
           (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
@@ -109,7 +114,7 @@ jobs:
           $name = "$env:BIN_NAME-${{ needs.prepare.outputs.tag }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" "dist/$name/"
-          Copy-Item README.md, config.example.toml, assets/fonts/LICENSE-Inter.txt "dist/$name/"
+          Copy-Item README.md, assets/fonts/LICENSE-Inter.txt "dist/$name/"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"

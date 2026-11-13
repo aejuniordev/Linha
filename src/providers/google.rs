@@ -1,16 +1,12 @@
-//! Google Agenda (Gmail) via Calendar API v3, login OAuth com PKCE e redirect em 127.0.0.1.
+//! Google Agenda (Gmail) via Calendar API v3. Login pelo navegador
+//! (authorization code + PKCE, retorno em http://127.0.0.1).
 
-use std::time::Duration;
-
-use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
-use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use url::Url;
 
+use super::oauth::{self, Flow};
 use super::{check, client};
 use crate::config::GoogleCfg;
 use crate::model::{parse_hex_color, Event, Source, When, DEFAULT_COLOR};
@@ -21,102 +17,53 @@ const AUTH: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN: &str = "https://oauth2.googleapis.com/token";
 const API: &str = "https://www.googleapis.com/calendar/v3";
 
-fn require(cfg: &GoogleCfg) -> Result<()> {
-    if cfg.client_id.trim().is_empty() || cfg.client_secret.trim().is_empty() {
-        bail!("Google: preencha `client_id` e `client_secret` em [google] no config.toml (veja o README)");
-    }
-    Ok(())
+fn credentials(cfg: &GoogleCfg) -> Result<(String, String)> {
+    cfg.credentials().ok_or_else(|| anyhow!("Google: esta versão do Linha foi compilada sem o app do Google (veja docs/OAUTH.md)"))
 }
 
-/// Abre o navegador, espera o retorno em 127.0.0.1 e guarda os tokens.
-pub fn login(cfg: &GoogleCfg) -> Result<()> {
-    require(cfg)?;
-    let server = tiny_http::Server::http("127.0.0.1:0").map_err(|e| anyhow!("servidor local: {e}"))?;
-    let port = server.server_addr().to_ip().map(|a| a.port()).ok_or_else(|| anyhow!("sem porta local"))?;
-    let redirect = format!("http://127.0.0.1:{port}");
-
-    let mut rng = rand::rng();
-    let verifier = Alphanumeric.sample_string(&mut rng, 64);
-    let state = Alphanumeric.sample_string(&mut rng, 24);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-
-    let auth_url = Url::parse_with_params(
+/// Abre o navegador para a pessoa entrar na conta Google e guarda os tokens.
+pub fn login(cfg: &GoogleCfg, flow: &Flow) -> Result<()> {
+    let (id, secret) = credentials(cfg)?;
+    let grant = oauth::authorize(
+        flow,
         AUTH,
+        "127.0.0.1",
         &[
-            ("client_id", cfg.client_id.trim()),
-            ("redirect_uri", redirect.as_str()),
-            ("response_type", "code"),
+            ("client_id", id.as_str()),
             ("scope", SCOPE),
-            ("code_challenge", challenge.as_str()),
-            ("code_challenge_method", "S256"),
-            ("state", state.as_str()),
             ("access_type", "offline"),
-            ("prompt", "consent"),
+            ("prompt", "consent select_account"),
         ],
-    )?;
-
-    println!();
-    println!("  Abrindo o navegador para entrar na sua conta Google…");
-    println!("  Se não abrir, cole este link:\n  {auth_url}");
-    println!();
-    let _ = webbrowser::open(auth_url.as_str());
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(300);
-    let code = loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            bail!("Google: tempo esgotado esperando o login");
-        }
-        let Some(req) = server.recv_timeout(left)? else { continue };
-        let url = Url::parse(&format!("http://127.0.0.1{}", req.url()))?;
-        let get = |k: &str| url.query_pairs().find(|(key, _)| key == k).map(|(_, v)| v.into_owned());
-        if get("state").as_deref() != Some(state.as_str()) {
-            let _ = req.respond(tiny_http::Response::from_string("").with_status_code(404));
-            continue;
-        }
-        let ok = get("code");
-        let html = if ok.is_some() {
-            "<h2 style='font-family:-apple-system,system-ui;font-weight:500'>Pronto ✓</h2><p style='font-family:system-ui;color:#888'>Pode fechar esta aba.</p>"
-        } else {
-            "<h2 style='font-family:system-ui'>Login cancelado</h2>"
-        };
-        let header = tiny_http::Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
-        let _ = req.respond(tiny_http::Response::from_string(html).with_header(header));
-        match ok {
-            Some(c) => break c,
-            None => bail!("Google: {}", get("error").unwrap_or_else(|| "login cancelado".into())),
-        }
-    };
-
+    )
+    .context("Google")?;
     let resp = client()
         .post(TOKEN)
         .form(&[
-            ("code", code.as_str()),
-            ("client_id", cfg.client_id.trim()),
-            ("client_secret", cfg.client_secret.trim()),
-            ("redirect_uri", redirect.as_str()),
+            ("code", grant.code.as_str()),
+            ("client_id", id.as_str()),
+            ("client_secret", secret.as_str()),
+            ("redirect_uri", grant.redirect_uri.as_str()),
             ("grant_type", "authorization_code"),
-            ("code_verifier", verifier.as_str()),
+            ("code_verifier", grant.verifier.as_str()),
         ])
-        .send().context("Google: sem conexão com o servidor")?;
+        .send()
+        .context("Google: sem conexão com o servidor")?;
     let tr: TokenResponse = check(resp, "Google (trocar código)")?.json()?;
-    Tokens::from_response(&tr, None).save(Source::Google)?;
-    println!("  Google conectado.");
-    Ok(())
+    Tokens::from_response(&tr, None).save(Source::Google)
 }
 
 fn access_token(cfg: &GoogleCfg) -> Result<String> {
-    require(cfg)?;
-    let tokens = Tokens::load(Source::Google).ok_or_else(|| anyhow!("Google: rode `linha login google`"))?;
+    let (id, secret) = credentials(cfg)?;
+    let tokens = Tokens::load(Source::Google).ok_or_else(|| anyhow!("Google: conecte a conta em Ajustes"))?;
     if tokens.is_fresh() {
         return Ok(tokens.access_token);
     }
-    let refresh = tokens.refresh_token.clone().ok_or_else(|| anyhow!("Google: sessão expirou, rode `linha login google`"))?;
+    let refresh = tokens.refresh_token.clone().ok_or_else(|| anyhow!("Google: sessão expirou, conecte de novo em Ajustes"))?;
     let resp = client()
         .post(TOKEN)
         .form(&[
-            ("client_id", cfg.client_id.trim()),
-            ("client_secret", cfg.client_secret.trim()),
+            ("client_id", id.as_str()),
+            ("client_secret", secret.as_str()),
             ("refresh_token", refresh.as_str()),
             ("grant_type", "refresh_token"),
         ])

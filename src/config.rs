@@ -1,11 +1,18 @@
-//! Configuração em TOML (`linha config` mostra o caminho).
+//! Preferências do Linha. Editadas pela tela de Ajustes e gravadas em
+//! `config.toml`, na pasta de configuração do usuário (veja `store::config_dir`).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::store;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+// IDs dos apps OAuth embutidos no executável na hora do build (veja docs/OAUTH.md).
+// Ninguém precisa registrar app próprio: basta clicar em "Conectar" nos Ajustes.
+const OUTLOOK_CLIENT_ID: Option<&str> = option_env!("LINHA_OUTLOOK_CLIENT_ID");
+const GOOGLE_CLIENT_ID: Option<&str> = option_env!("LINHA_GOOGLE_CLIENT_ID");
+const GOOGLE_CLIENT_SECRET: Option<&str> = option_env!("LINHA_GOOGLE_CLIENT_SECRET");
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub geral: Geral,
@@ -14,12 +21,12 @@ pub struct Config {
     pub icloud: ICloudCfg,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Geral {
     /// Quantos dias mostrar a partir de hoje (1 = só hoje).
     pub dias: u32,
-    /// Intervalo de sincronização do daemon, em minutos.
+    /// Intervalo de sincronização, em minutos.
     pub intervalo_sync_min: u64,
     /// Fecha a janela sozinha depois de N segundos sem interação (0 = nunca).
     pub fechar_apos_seg: u64,
@@ -33,6 +40,8 @@ pub struct Geral {
     pub limiar_sono_seg: u64,
     /// Janela sem bordas com cantos arredondados (precisa de compositor no Linux).
     pub cantos_arredondados: bool,
+    /// Registra o daemon para iniciar junto com o sistema.
+    pub iniciar_com_sistema: bool,
 }
 
 impl Default for Geral {
@@ -46,15 +55,18 @@ impl Default for Geral {
             abrir_ao_iniciar: true,
             limiar_sono_seg: 30,
             cantos_arredondados: true,
+            iniciar_com_sistema: false,
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OutlookCfg {
+    /// Conta conectada e exibida na linha do tempo.
     pub ativo: bool,
-    /// Application (client) ID de um app registrado no Microsoft Entra (Azure).
+    /// Substitui o client ID embutido (só para desenvolvimento).
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub client_id: String,
     /// "common" aceita contas pessoais (outlook.com/hotmail) e corporativas.
     pub tenant: String,
@@ -66,25 +78,55 @@ impl Default for OutlookCfg {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+impl OutlookCfg {
+    pub fn client_id(&self) -> Option<String> {
+        pick(&self.client_id, OUTLOOK_CLIENT_ID)
+    }
+}
+
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GoogleCfg {
+    /// Conta conectada e exibida na linha do tempo.
     pub ativo: bool,
-    /// OAuth client do tipo "App para computador" no Google Cloud Console.
+    /// Substituem o app OAuth embutido (só para desenvolvimento).
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub client_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub client_secret: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+impl GoogleCfg {
+    /// (client_id, client_secret). Em apps de desktop o "secret" do Google não é
+    /// segredo de verdade — a segurança vem do PKCE e do redirect em loopback.
+    pub fn credentials(&self) -> Option<(String, String)> {
+        if !self.client_id.trim().is_empty() {
+            return Some((self.client_id.trim().to_string(), self.client_secret.trim().to_string()));
+        }
+        Some((pick("", GOOGLE_CLIENT_ID)?, pick("", GOOGLE_CLIENT_SECRET).unwrap_or_default()))
+    }
+}
+
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ICloudCfg {
+    /// Conta conectada e exibida na linha do tempo.
     pub ativo: bool,
     pub apple_id: String,
     /// Senha de app gerada em account.apple.com (não é a senha do Apple ID).
     pub senha_app: String,
 }
 
-pub const EXAMPLE: &str = include_str!("../config.example.toml");
+/// Valor da config se preenchido; senão o embutido no build (se houver).
+fn pick(own: &str, builtin: Option<&'static str>) -> Option<String> {
+    let own = own.trim();
+    if !own.is_empty() {
+        return Some(own.to_string());
+    }
+    builtin.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
 
 impl Config {
     pub fn load() -> Result<Config> {
@@ -96,13 +138,12 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("config inválida em {}", path.display()))
     }
 
-    /// Cria o arquivo de exemplo se ainda não existir. Devolve o caminho.
-    pub fn ensure_file() -> Result<std::path::PathBuf> {
-        let path = store::config_path();
-        if !path.exists() {
-            store::write_private(&path, EXAMPLE.as_bytes())?;
-        }
-        Ok(path)
+    pub fn save(&self) -> Result<()> {
+        let text = format!(
+            "# Linha — gerado pela tela de Ajustes. Prefira mudar por lá.\n\n{}",
+            toml::to_string_pretty(self)?
+        );
+        store::write_private(&store::config_path(), text.as_bytes())
     }
 
     pub fn any_enabled(&self) -> bool {

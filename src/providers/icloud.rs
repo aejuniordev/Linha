@@ -123,7 +123,7 @@ fn discover(dav: &Dav) -> Result<Vec<CalInfo>> {
 
 pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Event>> {
     if cfg.apple_id.trim().is_empty() || cfg.senha_app.trim().is_empty() {
-        bail!("iCloud: preencha `apple_id` e `senha_app` em [icloud] no config.toml");
+        bail!("iCloud: conecte a conta em Ajustes (Apple ID + senha de app)");
     }
     let dav = Dav { http: client(), cfg };
     let (s, e) = (from.format("%Y%m%dT%H%M%SZ"), to.format("%Y%m%dT%H%M%SZ"));
@@ -152,16 +152,11 @@ pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
     Ok(out)
 }
 
-/// Testa as credenciais e lista os calendários encontrados.
-pub fn login(cfg: &ICloudCfg) -> Result<()> {
+/// Testa as credenciais. Devolve os nomes dos calendários encontrados.
+pub fn login(cfg: &ICloudCfg) -> Result<Vec<String>> {
     if cfg.apple_id.trim().is_empty() || cfg.senha_app.trim().is_empty() {
-        bail!("iCloud: preencha `apple_id` e `senha_app` em [icloud] no config.toml");
+        bail!("iCloud: preencha o Apple ID e a senha de app");
     }
     let dav = Dav { http: client(), cfg };
-    let cals = discover(&dav)?;
-    println!("  iCloud conectado. {} calendário(s):", cals.len());
-    for c in cals {
-        println!("   • {}", c.name);
-    }
-    Ok(())
+    Ok(discover(&dav)?.into_iter().map(|c| c.name).collect())
 }

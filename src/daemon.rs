@@ -75,6 +75,20 @@ pub fn open_window() {
     }
 }
 
+/// Inicia o daemon em segundo plano agora (se já estiver rodando, o novo sai sozinho).
+pub fn spawn() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
+    let _ = cmd.spawn();
+}
+
 /// Avisa a janela já aberta para tocar a animação de novo. `true` se havia uma.
 pub fn ping_window() -> bool {
     TcpStream::connect_timeout(&([127, 0, 0, 1], WINDOW_PORT).into(), Duration::from_millis(300)).is_ok()
@@ -160,14 +174,23 @@ mod imp {
 
     const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
+    /// `reg.exe` sem abrir janela de console (a interface chama isto).
+    fn reg() -> Command {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = Command::new("reg");
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    }
+
     pub fn autostart(enable: bool, exe: &str) -> Result<()> {
         let out = if enable {
-            Command::new("reg")
+            reg()
                 .args(["add", KEY, "/v", "Linha", "/t", "REG_SZ", "/f", "/d"])
                 .arg(format!("\"{exe}\" daemon"))
                 .output()?
         } else {
-            Command::new("reg").args(["delete", KEY, "/v", "Linha", "/f"]).output()?
+            reg().args(["delete", KEY, "/v", "Linha", "/f"]).output()?
         };
         if enable && !out.status.success() {
             bail!("reg: {}", String::from_utf8_lossy(&out.stderr));

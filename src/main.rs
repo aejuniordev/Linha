@@ -21,13 +21,16 @@ Linha — a linha do tempo do seu dia
 
 USO
   linha                     abre a linha do tempo
+  linha ajustes             abre a tela de Ajustes (contas e preferências)
   linha demo                abre com uma agenda de exemplo
   linha daemon              roda em segundo plano: sincroniza e abre ao despertar
-  linha config              cria/mostra o arquivo de configuração
-  linha login <conta>       conecta outlook | google | icloud
-  linha logout <conta>      esquece o login de uma conta
   linha sync                sincroniza agora e lista os eventos no terminal
+  linha login <conta>       conecta outlook | google pelo navegador
+  linha logout <conta>      desconecta outlook | google | icloud
   linha autostart on|off    inicia o daemon junto com o sistema
+  linha pasta               mostra onde ficam as configurações
+
+As contas e preferências ficam na tela de Ajustes (ícone de engrenagem).
 ";
 
 fn main() {
@@ -50,40 +53,67 @@ fn run() -> Result<()> {
             if daemon::ping_window() {
                 return Ok(());
             }
-            ui::run(Config::load()?, false)
+            ui::run(Config::load()?, false, false)
         }
-        Some("demo") => ui::run(Config::load().unwrap_or_default(), true),
+        Some("ajustes" | "config" | "settings") => ui::run(Config::load().unwrap_or_default(), false, true),
+        Some("demo") => ui::run(Config::load().unwrap_or_default(), true, false),
         Some("daemon") => daemon::run(),
-        Some("config") => {
-            let path = Config::ensure_file()?;
-            println!("{}", path.display());
+        Some("pasta") => {
+            println!("configuração: {}", store::config_path().display());
+            println!("dados:        {}", store::data_dir().display());
             Ok(())
         }
         Some("login") => {
-            let cfg = Config::load()?;
-            match parse_source(arg(1))? {
-                Source::Outlook => providers::outlook::login(&cfg.outlook),
-                Source::Google => providers::google::login(&cfg.google),
-                Source::ICloud => providers::icloud::login(&cfg.icloud),
+            let mut cfg = Config::load()?;
+            let flow = providers::oauth::Flow::default();
+            let src = parse_source(arg(1))?;
+            match src {
+                Source::Outlook => providers::outlook::login(&cfg.outlook, &flow)?,
+                Source::Google => providers::google::login(&cfg.google, &flow)?,
+                Source::ICloud => bail!("o iCloud usa Apple ID + senha de app: conecte pela tela de Ajustes (`linha ajustes`)"),
             }
+            set_enabled(&mut cfg, src, true);
+            cfg.save()?;
+            println!("{} conectado.", src.label());
+            Ok(())
         }
         Some("logout") => {
+            let mut cfg = Config::load()?;
             let src = parse_source(arg(1))?;
             store::Tokens::delete(src);
-            println!("{}: login esquecido.", src.label());
+            set_enabled(&mut cfg, src, false);
+            if src == Source::ICloud {
+                cfg.icloud.senha_app.clear();
+            }
+            cfg.save()?;
+            println!("{}: desconectado.", src.label());
             Ok(())
         }
         Some("sync") => print_sync(),
-        Some("autostart") => match arg(1) {
-            Some("on") => daemon::autostart(true),
-            Some("off") => daemon::autostart(false),
-            _ => bail!("use: linha autostart on|off"),
-        },
+        Some("autostart") => {
+            let on = match arg(1) {
+                Some("on") => true,
+                Some("off") => false,
+                _ => bail!("use: linha autostart on|off"),
+            };
+            daemon::autostart(on)?;
+            let mut cfg = Config::load()?;
+            cfg.geral.iniciar_com_sistema = on;
+            cfg.save()
+        }
         Some("-h" | "--help" | "help") => {
             print!("{HELP}");
             Ok(())
         }
         Some(other) => bail!("comando desconhecido: {other}\n\n{HELP}"),
+    }
+}
+
+fn set_enabled(cfg: &mut Config, src: Source, on: bool) {
+    match src {
+        Source::Outlook => cfg.outlook.ativo = on,
+        Source::Google => cfg.google.ativo = on,
+        Source::ICloud => cfg.icloud.ativo = on,
     }
 }
 
@@ -99,7 +129,7 @@ fn parse_source(s: Option<&str>) -> Result<Source> {
 fn print_sync() -> Result<()> {
     let cfg = Config::load()?;
     if !cfg.any_enabled() {
-        bail!("nenhuma conta ativa — rode `linha config` e ative pelo menos uma");
+        bail!("nenhuma conta conectada — abra os Ajustes (`linha ajustes`) e conecte pelo menos uma");
     }
     let cache = sync::sync_all(&cfg);
     for (src, st) in &cache.status {

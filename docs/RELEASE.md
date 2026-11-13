@@ -2,6 +2,8 @@
 
 As releases são geradas pelo GitHub Actions (`.github/workflows/release.yml`). Você só precisa atualizar a versão e enviar uma tag: o pipeline compila para Linux, Windows e macOS e publica a release com os binários.
 
+> **Antes da primeira release:** cadastre os secrets `LINHA_OUTLOOK_CLIENT_ID`, `LINHA_GOOGLE_CLIENT_ID` e `LINHA_GOOGLE_CLIENT_SECRET` no GitHub (veja [OAUTH.md](OAUTH.md)). Sem eles o build passa, mas o botão **Conectar** do Outlook e do Google fica desativado.
+
 ## Versionamento
 
 Usamos [SemVer](https://semver.org/lang/pt-BR/): `MAJOR.MINOR.PATCH`.

@@ -1,16 +1,15 @@
-//! Outlook / Microsoft 365 via Microsoft Graph, com login por "device code".
+//! Outlook / Microsoft 365 via Microsoft Graph. Login pelo navegador
+//! (authorization code + PKCE, retorno em http://localhost).
 
-use std::thread::sleep;
-use std::time::Duration;
-
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde::Deserialize;
 
+use super::oauth::{self, Flow};
 use super::{check, client};
 use crate::config::OutlookCfg;
 use crate::model::{parse_hex_color, Event, Source, When, DEFAULT_COLOR};
-use crate::store::{OAuthError, TokenResponse, Tokens};
+use crate::store::{TokenResponse, Tokens};
 
 const SCOPE: &str = "offline_access Calendars.Read";
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
@@ -20,80 +19,49 @@ fn endpoint(cfg: &OutlookCfg, what: &str) -> String {
     format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/{what}")
 }
 
-fn require(cfg: &OutlookCfg) -> Result<()> {
-    if cfg.client_id.trim().is_empty() {
-        bail!("Outlook: falta `client_id` em [outlook] no config.toml (veja o README)");
-    }
-    Ok(())
+fn client_id(cfg: &OutlookCfg) -> Result<String> {
+    cfg.client_id().ok_or_else(|| anyhow!("Outlook: esta versão do Linha foi compilada sem o app da Microsoft (veja docs/OAUTH.md)"))
 }
 
-#[derive(Deserialize)]
-struct DeviceCode {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    expires_in: u64,
-    interval: Option<u64>,
-}
-
-/// Login interativo no terminal: mostra um código para digitar em microsoft.com/devicelogin.
-pub fn login(cfg: &OutlookCfg) -> Result<()> {
-    require(cfg)?;
-    let http = client();
-    let dc: DeviceCode = check(
-        http.post(endpoint(cfg, "devicecode"))
-            .form(&[("client_id", cfg.client_id.trim()), ("scope", SCOPE)])
-            .send().context("Outlook: sem conexão com o servidor")?,
-        "Outlook (device code)",
-    )?
-    .json()?;
-
-    println!();
-    println!("  1. Abra  {}", dc.verification_uri);
-    println!("  2. Digite o código  {}", dc.user_code);
-    println!();
-    let _ = webbrowser::open(&dc.verification_uri);
-
-    let mut interval = dc.interval.unwrap_or(5);
-    let deadline = std::time::Instant::now() + Duration::from_secs(dc.expires_in);
-    while std::time::Instant::now() < deadline {
-        sleep(Duration::from_secs(interval));
-        let resp = http
-            .post(endpoint(cfg, "token"))
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", cfg.client_id.trim()),
-                ("device_code", dc.device_code.as_str()),
-            ])
-            .send().context("Outlook: sem conexão com o servidor")?;
-        if resp.status().is_success() {
-            let tr: TokenResponse = resp.json()?;
-            Tokens::from_response(&tr, None).save(Source::Outlook)?;
-            println!("  Outlook conectado.");
-            return Ok(());
-        }
-        let err: OAuthError = resp.json().context("resposta inesperada do login da Microsoft")?;
-        match err.error.as_str() {
-            "authorization_pending" => continue,
-            "slow_down" => interval += 5,
-            _ => bail!("Outlook: {} {}", err.error, err.error_description.unwrap_or_default()),
-        }
-    }
-    bail!("Outlook: o código expirou, tente de novo")
+/// Abre o navegador para a pessoa entrar na conta Microsoft e guarda os tokens.
+pub fn login(cfg: &OutlookCfg, flow: &Flow) -> Result<()> {
+    let id = client_id(cfg)?;
+    // A Microsoft aceita qualquer porta em http://localhost para apps de desktop.
+    let grant = oauth::authorize(
+        flow,
+        &endpoint(cfg, "authorize"),
+        "localhost",
+        &[("client_id", id.as_str()), ("scope", SCOPE), ("prompt", "select_account")],
+    )
+    .context("Outlook")?;
+    let resp = client()
+        .post(endpoint(cfg, "token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", id.as_str()),
+            ("code", grant.code.as_str()),
+            ("redirect_uri", grant.redirect_uri.as_str()),
+            ("code_verifier", grant.verifier.as_str()),
+            ("scope", SCOPE),
+        ])
+        .send()
+        .context("Outlook: sem conexão com o servidor")?;
+    let tr: TokenResponse = check(resp, "Outlook (trocar código)")?.json()?;
+    Tokens::from_response(&tr, None).save(Source::Outlook)
 }
 
 fn access_token(cfg: &OutlookCfg) -> Result<String> {
-    require(cfg)?;
-    let tokens = Tokens::load(Source::Outlook).ok_or_else(|| anyhow!("Outlook: rode `linha login outlook`"))?;
+    let id = client_id(cfg)?;
+    let tokens = Tokens::load(Source::Outlook).ok_or_else(|| anyhow!("Outlook: conecte a conta em Ajustes"))?;
     if tokens.is_fresh() {
         return Ok(tokens.access_token);
     }
-    let refresh = tokens.refresh_token.clone().ok_or_else(|| anyhow!("Outlook: sessão expirou, rode `linha login outlook`"))?;
+    let refresh = tokens.refresh_token.clone().ok_or_else(|| anyhow!("Outlook: sessão expirou, conecte de novo em Ajustes"))?;
     let resp = client()
         .post(endpoint(cfg, "token"))
         .form(&[
             ("grant_type", "refresh_token"),
-            ("client_id", cfg.client_id.trim()),
+            ("client_id", id.as_str()),
             ("refresh_token", refresh.as_str()),
             ("scope", SCOPE),
         ])

@@ -34,104 +34,81 @@ No Linux, para rodar é preciso ter OpenGL e `libxkbcommon` (já vêm em qualque
 
 ## Uso
 
+Abra o Linha e clique na **engrenagem** (ou em *Abrir Ajustes* na primeira vez). Tudo se configura por lá: contas, quantos dias mostrar, tema, iniciar com o sistema etc. As mudanças são gravadas na hora.
+
+Na janela: **Esc** fecha (nos Ajustes, volta), **Ctrl/Cmd + R** ou **F5** sincroniza, arraste pelo topo para mover. Os botões ⚙ ⟳ × aparecem quando o mouse está sobre a janela.
+
+Pelo terminal também dá:
+
 ```text
 linha                     abre a linha do tempo
+linha ajustes             abre direto nos Ajustes
 linha demo                abre com uma agenda de exemplo
 linha daemon              roda em segundo plano: sincroniza e abre ao despertar
-linha config              cria/mostra o arquivo de configuração
-linha login <conta>       conecta outlook | google | icloud
-linha logout <conta>      esquece o login de uma conta
 linha sync                sincroniza agora e lista os eventos no terminal
+linha login <conta>       conecta outlook | google pelo navegador
+linha logout <conta>      desconecta outlook | google | icloud
 linha autostart on|off    inicia o daemon junto com o sistema
+linha pasta               mostra onde ficam as configurações
 ```
-
-Na janela: **Esc** fecha, **Ctrl/Cmd + R** ou **F5** sincroniza, arraste pelo topo para mover. Os botões ⟳ e × aparecem quando o mouse está sobre a janela.
 
 ### Fazer aparecer quando o computador desperta
 
-```bash
-linha autostart on
-```
+Ative **Ajustes → Inicialização → Iniciar com o sistema**. Isso registra `linha daemon` para iniciar com o sistema (Linux: `~/.config/autostart`, macOS: LaunchAgent, Windows: chave *Run* do registro) e já o inicia. O daemon:
 
-Isso registra `linha daemon` para iniciar com o sistema (Linux: `~/.config/autostart`, macOS: LaunchAgent, Windows: chave *Run* do registro). O daemon:
-
-1. abre a linha do tempo no login (desligue com `abrir_ao_iniciar = false`);
-2. sincroniza a cada `intervalo_sync_min` minutos;
+1. abre a linha do tempo no login (opção *Mostrar a linha do tempo ao entrar*);
+2. sincroniza no intervalo escolhido;
 3. percebe que o computador **voltou do sono** e abre a janela de novo, já sincronizando.
 
-A detecção funciona igual nos três sistemas, sem APIs específicas: uma thread dorme 5 s por vez e, se o relógio de parede andou bem mais do que isso (`limiar_sono_seg`), é porque a máquina estava suspensa. Se a janela já estiver aberta, ela só toca a animação de entrada de novo.
+A detecção funciona igual nos três sistemas, sem APIs específicas: uma thread dorme 5 s por vez e, se o relógio de parede andou bem mais do que isso (*Considerar suspensão após*), é porque a máquina estava suspensa. Se a janela já estiver aberta, ela só toca a animação de entrada de novo.
 
 ## Conectar as contas
 
-Rode `linha config` para criar o arquivo e ver onde ele fica. Ative as contas que quiser (`ativo = true`) e siga os passos abaixo. Depois, `linha sync` mostra no terminal se deu tudo certo.
+Em **Ajustes → Contas**:
 
-### Outlook / Microsoft 365 / Hotmail
+- **Outlook / Microsoft 365 / Hotmail** e **Google Agenda (Gmail)**: clique em **Conectar**. O navegador abre na página de login da Microsoft ou do Google; depois de autorizar, a aba mostra “Pronto ✓” e a conta aparece como conectada. Por baixo é OAuth 2.0 com PKCE e retorno capturado em `127.0.0.1`. O Linha pede só leitura da agenda.
+- **iCloud**: a Apple não oferece login por navegador para agendas. Gere uma **senha de app** em account.apple.com → *Entrar e segurança → Senhas de app* (o link está nos Ajustes), informe o Apple ID e a senha e clique em **Conectar**. O iCloud é lido via CalDAV; eventos recorrentes são expandidos pelo servidor ou, se ele não expandir, localmente (diário, semanal, mensal, anual com `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`, `BYMONTH`, exceções e datas removidas).
 
-O login usa o fluxo de “código de dispositivo” da Microsoft, então você precisa de um *client ID* próprio (gratuito, uma vez só):
+Cada conta conectada pode ser escondida da linha do tempo sem desconectar. **Desconectar** apaga os tokens do computador.
 
-1. Entre em https://entra.microsoft.com → **Aplicativos → Registros de aplicativo → Novo registro**.
-2. Nome: `Linha`. Tipos de conta: **contas em qualquer diretório organizacional e contas Microsoft pessoais**. Registrar.
-3. Em **Autenticação**, ative **Permitir fluxos de clientes públicos**.
-4. Em **Permissões de API**, confira que há *Microsoft Graph → Delegada → `Calendars.Read`* (adicione se faltar).
-5. Copie o **ID do aplicativo (cliente)** para `client_id` em `[outlook]`.
-6. `linha login outlook` — o navegador abre em microsoft.com/devicelogin; digite o código mostrado no terminal.
+> Para quem mantém o projeto: os apps OAuth da Microsoft e do Google são embutidos no build. Veja [docs/OAUTH.md](docs/OAUTH.md).
 
-> Em contas de empresa, o administrador pode precisar aprovar o app.
+## Onde ficam os dados
 
-### Google Agenda (Gmail)
-
-1. Em https://console.cloud.google.com crie um projeto e ative a **Google Calendar API**.
-2. Configure a tela de consentimento OAuth (tipo *Externo*) e adicione seu e-mail como usuário de teste.
-3. Crie um **ID do cliente OAuth** do tipo **App para computador** e copie o *client ID* e o *client secret* para `[google]`.
-4. `linha login google` — o navegador abre, você autoriza e pronto (o retorno é capturado em `127.0.0.1`, com PKCE).
-
-> Enquanto o app estiver em modo “Teste” no Google, o login expira a cada 7 dias. Para uso pessoal contínuo, publique o app (o Google mostra um aviso de “app não verificado” que você pode aceitar).
-
-### iCloud
-
-1. Em https://account.apple.com → **Entrar e segurança → Senhas de app**, gere uma senha (precisa ter autenticação de dois fatores).
-2. Preencha `apple_id` e `senha_app` em `[icloud]`.
-3. `linha login icloud` — testa a conexão e lista seus calendários.
-
-O iCloud é lido via CalDAV. O Linha pede ao servidor para expandir eventos recorrentes e, se ele não expandir, expande localmente (diário, semanal, mensal, anual com `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`, `BYMONTH`, exceções e datas removidas).
-
-## Configuração
-
-| chave | padrão | o que faz |
+| sistema | configuração | tokens e cache |
 |---|---|---|
-| `dias` | `2` | quantos dias mostrar a partir de hoje |
-| `intervalo_sync_min` | `10` | intervalo de sincronização |
-| `fechar_apos_seg` | `0` | fecha sozinha após N s parada (0 = nunca) |
-| `tema` | `"sistema"` | `"sistema"`, `"claro"` ou `"escuro"` |
-| `sempre_no_topo` | `true` | janela por cima das outras |
-| `abrir_ao_iniciar` | `true` | abre quando o daemon inicia |
-| `limiar_sono_seg` | `30` | “sumiço” do relógio que conta como sono |
-| `cantos_arredondados` | `true` | janela transparente com cantos de 24 px; use `false` no Linux sem compositor |
+| Windows | `%APPDATA%\Linha\config\config.toml` | `%APPDATA%\Linha\data` |
+| macOS | `~/Library/Application Support/Linha/config.toml` | `~/Library/Application Support/Linha` |
+| Linux | `~/.config/linha/config.toml` | `~/.local/share/linha` |
+
+Os botões *Abrir pasta* nos Ajustes levam direto até elas. O `config.toml` é gerado pelos Ajustes; não é preciso editá-lo.
 
 ## Privacidade
 
 - Tudo é **somente leitura** e fica na sua máquina. Nenhum servidor intermediário.
-- Tokens OAuth e o cache de eventos ficam na pasta de dados do usuário com permissão `0600` (Unix).
-- A senha de app do iCloud fica no `config.toml` (também `0600`). Ela pode ser revogada a qualquer momento no site da Apple.
+- Tokens OAuth, a configuração e o cache de eventos são gravados com permissão `0600` (Unix).
+- A senha de app do iCloud fica no `config.toml`. Ela pode ser revogada a qualquer momento no site da Apple; *Desconectar* a apaga do computador.
 
 ## Estrutura
 
 ```text
 src/
   main.rs            comandos de terminal
-  config.rs          config.toml
+  config.rs          preferências (config.toml) e IDs OAuth embutidos
   model.rs           Evento, origem, cache
-  store.rs           caminhos, escrita atômica, tokens
+  store.rs           pastas do usuário, escrita atômica, tokens
   sync.rs            sincroniza as contas em paralelo
   daemon.rs          segundo plano, detecção de despertar, início automático
   demo.rs            agenda de exemplo
   providers/
-    outlook.rs       Microsoft Graph (device code)
-    google.rs        Google Calendar API (OAuth + PKCE em loopback)
+    oauth.rs         login pelo navegador (authorization code + PKCE, loopback)
+    outlook.rs       Microsoft Graph
+    google.rs        Google Calendar API
     icloud.rs        CalDAV
     ics.rs           leitor iCalendar + recorrências (com testes)
   ui/
     mod.rs           janela, cabeçalho, rodapé, fades de entrada/saída
+    settings.rs      tela de Ajustes
     timeline.rs      dias, cartões, linha do “agora”, cascata
     theme.rs         cores do iOS, fontes Inter
     anim.rs          curvas de animação

@@ -2,6 +2,7 @@
 
 mod anim;
 mod fmt;
+mod settings;
 mod theme;
 mod timeline;
 
@@ -27,7 +28,7 @@ use theme::{fade, font, font_named, Pal, LIGHT, MEDIUM};
 const RADIUS: u8 = 24;
 const FOOTER_H: f32 = 40.0;
 
-pub fn run(cfg: Config, demo: bool) -> anyhow::Result<()> {
+pub fn run(cfg: Config, demo: bool, open_settings: bool) -> anyhow::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Linha")
         .with_app_id("linha")
@@ -40,7 +41,7 @@ pub fn run(cfg: Config, demo: bool) -> anyhow::Result<()> {
         viewport = viewport.with_always_on_top();
     }
     let options = eframe::NativeOptions { viewport, centered: true, ..Default::default() };
-    eframe::run_native("Linha", options, Box::new(move |cc| Ok(Box::new(LinhaApp::new(cc, cfg, demo)))))
+    eframe::run_native("Linha", options, Box::new(move |cc| Ok(Box::new(LinhaApp::new(cc, cfg, demo, open_settings)))))
         .map_err(|e| anyhow::anyhow!("falha ao abrir a janela: {e}"))
 }
 
@@ -56,16 +57,13 @@ pub struct LinhaApp {
     closing_at: Option<f64>,
     last_input: f64,
     last_sync: f64,
+    settings: Option<settings::Settings>,
 }
 
 impl LinhaApp {
-    fn new(cc: &eframe::CreationContext<'_>, cfg: Config, demo: bool) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, cfg: Config, demo: bool, open_settings: bool) -> Self {
         theme::install_fonts(&cc.egui_ctx);
-        cc.egui_ctx.set_theme(match cfg.geral.tema.as_str() {
-            "claro" => ThemePreference::Light,
-            "escuro" => ThemePreference::Dark,
-            _ => ThemePreference::System,
-        });
+        cc.egui_ctx.set_theme(theme_pref(&cfg.geral.tema));
 
         // Escuta pedidos de "aparecer de novo" (vindos do daemon ao despertar).
         let replay = Arc::new(AtomicBool::new(false));
@@ -81,6 +79,7 @@ impl LinhaApp {
             });
         }
 
+        let panel = open_settings.then(|| settings::Settings::new(&cfg));
         let mut app = LinhaApp {
             cache: if demo { demo::cache() } else { Cache::load() },
             cfg,
@@ -93,6 +92,7 @@ impl LinhaApp {
             closing_at: None,
             last_input: 0.0,
             last_sync: 0.0,
+            settings: panel,
         };
         app.start_sync(&cc.egui_ctx, false, 0.0);
         app
@@ -121,6 +121,60 @@ impl LinhaApp {
         if self.closing_at.is_none() {
             self.closing_at = Some(now);
         }
+    }
+
+    fn open_settings(&mut self) {
+        if self.settings.is_none() {
+            self.settings = Some(settings::Settings::new(&self.cfg));
+        }
+    }
+
+    fn close_settings(&mut self) {
+        if let Some(mut s) = self.settings.take() {
+            s.cancel();
+        }
+    }
+
+    /// Aplica na hora o que dá para mudar com a janela aberta (tema e "sempre no topo").
+    fn apply_window(&self, ctx: &egui::Context) {
+        ctx.set_theme(theme_pref(&self.cfg.geral.tema));
+        let level = if self.cfg.geral.sempre_no_topo { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
+    }
+
+    /// Tela de Ajustes, ocupando a janela toda.
+    fn settings_page(&mut self, ui: &mut egui::Ui, rect: Rect, pal: &Pal, alpha: f32, now: f64) {
+        let ctx = ui.ctx().clone();
+        let top = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 64.0));
+        if ui.interact(top, Id::unique("arrastar-ajustes"), Sense::click_and_drag()).drag_started() {
+            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+        }
+        let area = Rect::from_min_max(pos2(rect.left() + 20.0, rect.top() + 22.0), pos2(rect.right() - 20.0, rect.bottom() - 8.0));
+        let Some(panel) = self.settings.as_mut() else { return };
+        let out = ui
+            .scope_builder(UiBuilder::new().max_rect(area), |ui| {
+                ui.multiply_opacity(alpha);
+                panel.show(ui, pal)
+            })
+            .inner;
+        if out.changed {
+            self.cfg = panel.cfg.clone();
+            self.apply_window(&ctx);
+        }
+        if out.sync {
+            self.start_sync(&ctx, true, now);
+        }
+        if out.close {
+            self.close_settings();
+        }
+    }
+}
+
+fn theme_pref(tema: &str) -> ThemePreference {
+    match tema {
+        "claro" => ThemePreference::Light,
+        "escuro" => ThemePreference::Dark,
+        _ => ThemePreference::System,
     }
 }
 
@@ -166,13 +220,17 @@ impl eframe::App for LinhaApp {
             self.last_input = now;
         }
         if esc {
-            self.close(now);
+            if self.settings.is_some() {
+                self.close_settings();
+            } else {
+                self.close(now);
+            }
         }
         if refresh {
             self.start_sync(&ctx, true, now);
         }
         let auto_close = self.cfg.geral.fechar_apos_seg as f64;
-        if auto_close > 0.0 && now - self.last_input.max(opened) > auto_close {
+        if auto_close > 0.0 && self.settings.is_none() && now - self.last_input.max(opened) > auto_close {
             self.close(now);
         }
         if now - self.last_sync > (self.cfg.geral.intervalo_sync_min.max(1) * 60) as f64 {
@@ -201,15 +259,24 @@ impl eframe::App for LinhaApp {
             }
         }
 
+        if self.settings.is_some() {
+            self.settings_page(ui, rect, &pal, alpha, now);
+            if self.closing_at.is_some() || now - opened < 1.0 {
+                ctx.request_repaint();
+            }
+            return;
+        }
+
         let header_bottom = self.header(ui, rect, &pal, alpha, now, opened, vanish);
 
         // ---- linha do tempo (rolável) ----
         let area = Rect::from_min_max(pos2(rect.left() + 20.0, header_bottom), pos2(rect.right() - 20.0, rect.bottom() - FOOTER_H));
+        let mut want_settings = false;
         ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_width(area.width() - 8.0);
                 if !self.demo && !self.cfg.any_enabled() {
-                    onboarding(ui, &pal, alpha * ease(progress(now, opened, 0.2, 0.5)));
+                    want_settings = onboarding(ui, &pal, alpha * ease(progress(now, opened, 0.2, 0.5)));
                 } else {
                     let view = timeline::View {
                         pal,
@@ -225,6 +292,9 @@ impl eframe::App for LinhaApp {
             });
         });
         timeline::edge_fade(ui.painter(), Rect::from_min_max(pos2(rect.left() + 1.0, area.top()), pos2(rect.right() - 1.0, area.bottom())), fade(pal.bg, bg_alpha), 16.0);
+        if want_settings {
+            self.open_settings();
+        }
 
         self.footer(ui, rect, &pal, alpha * ease(progress(now, opened, 0.5, 0.5)), now);
 
@@ -256,16 +326,25 @@ impl LinhaApp {
         let show = ctx.animate_bool(Id::unique("botoes"), hovering) * alpha;
         let close_r = Rect::from_center_size(pos2(rect.right() - 26.0, rect.top() + 24.0), vec2(26.0, 26.0));
         let sync_r = close_r.translate(vec2(-32.0, 0.0));
+        let gear_r = sync_r.translate(vec2(-32.0, 0.0));
         let close_resp = ui.interact(close_r, Id::unique("fechar"), Sense::click());
         let sync_resp = ui.interact(sync_r, Id::unique("sincronizar"), Sense::click());
+        let gear_resp = ui.interact(gear_r, Id::unique("ajustes"), Sense::click()).on_hover_text("Ajustes");
         if close_resp.clicked() {
             self.close(now);
         }
         if sync_resp.clicked() {
             self.start_sync(&ctx, true, now);
         }
+        if gear_resp.clicked() && !self.demo {
+            self.open_settings();
+        }
         let p = ui.painter();
-        for (r, resp) in [(close_r, &close_resp), (sync_r, &sync_resp)] {
+        let mut buttons = vec![(close_r, &close_resp), (sync_r, &sync_resp)];
+        if !self.demo {
+            buttons.push((gear_r, &gear_resp));
+        }
+        for (r, resp) in buttons {
             let h = ctx.animate_bool(resp.id, resp.hovered());
             let bg = if pal.dark { Color32::from_white_alpha(22) } else { Color32::from_black_alpha(12) };
             p.circle_filled(r.center(), 13.0, fade(bg, show * (0.6 + 0.4 * h)));
@@ -294,6 +373,16 @@ impl LinhaApp {
             ink,
             Stroke::NONE,
         ));
+        // ícone de ajustes: engrenagem
+        if !self.demo {
+            let gc = gear_r.center();
+            p.circle_stroke(gc, 3.6, Stroke::new(1.6, ink));
+            for i in 0..8 {
+                let a = i as f32 / 8.0 * std::f32::consts::TAU;
+                let d = vec2(a.cos(), a.sin());
+                p.line_segment([gc + d * 5.0, gc + d * 7.2], Stroke::new(2.0, ink));
+            }
+        }
 
         // data
         let local = Local::now();
@@ -417,24 +506,31 @@ fn short(s: &str) -> String {
     }
 }
 
-fn onboarding(ui: &mut egui::Ui, pal: &Pal, a: f32) {
-    let w = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(vec2(w, 196.0), Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, CornerRadius::same(16), fade(pal.card, a));
-    let mut y = rect.top() + 18.0;
-    let x = rect.left() + 18.0;
-    let lines: [(&str, egui::FontId, Color32); 6] = [
-        ("Conecte suas agendas", font_named(17.0, theme::SEMIBOLD), pal.primary),
-        ("No terminal:", font(13.5), pal.secondary),
-        ("linha config", egui::FontId::monospace(13.0), pal.primary),
-        ("linha login outlook", egui::FontId::monospace(13.0), pal.primary),
-        ("linha login google", egui::FontId::monospace(13.0), pal.primary),
-        ("linha login icloud", egui::FontId::monospace(13.0), pal.primary),
-    ];
-    for (i, (t, f, c)) in lines.into_iter().enumerate() {
-        let g = p.layout(t.to_string(), f, fade(c, a), w - 36.0);
-        p.galley(pos2(x, y), g.clone(), Color32::PLACEHOLDER);
-        y += g.size().y + if i == 0 { 14.0 } else { 8.0 };
-    }
+/// Cartão de boas-vindas. Devolve `true` se a pessoa pediu para abrir os Ajustes.
+fn onboarding(ui: &mut egui::Ui, pal: &Pal, a: f32) -> bool {
+    let mut open = false;
+    ui.scope(|ui| {
+        ui.multiply_opacity(a);
+        egui::Frame::new()
+            .fill(pal.card)
+            .corner_radius(CornerRadius::same(16))
+            .inner_margin(egui::Margin::same(18))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("Conecte suas agendas").font(font_named(17.0, theme::SEMIBOLD)).color(pal.primary));
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Outlook, Google e iCloud numa linha só. O login é feito no navegador; nada passa por servidores do Linha.")
+                        .font(font(13.5))
+                        .color(pal.secondary),
+                );
+                ui.add_space(10.0);
+                let blue = if pal.dark { Color32::from_rgb(10, 132, 255) } else { Color32::from_rgb(0, 122, 255) };
+                let b = egui::Button::new(egui::RichText::new("Abrir Ajustes").font(font_named(14.5, MEDIUM)).color(Color32::WHITE))
+                    .fill(blue)
+                    .corner_radius(CornerRadius::same(10));
+                open = ui.add(b).clicked();
+            });
+    });
+    open
 }

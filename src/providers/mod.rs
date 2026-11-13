@@ -3,6 +3,7 @@
 pub mod google;
 pub mod icloud;
 pub mod ics;
+pub mod oauth;
 pub mod outlook;
 
 use std::time::Duration;
@@ -48,7 +49,7 @@ pub fn check(resp: Response, what: &str) -> Result<Response> {
     let body = resp.text().unwrap_or_default();
     let body: String = body.chars().take(300).collect();
     match status.as_u16() {
-        401 => bail!("{what}: não autorizado (401). Rode `linha login` de novo. {body}"),
+        401 => bail!("{what}: não autorizado (401). Conecte a conta de novo em Ajustes. {body}"),
         403 => bail!("{what}: acesso negado (403). {body}"),
         _ => bail!("{what}: HTTP {status}. {body}"),
     }

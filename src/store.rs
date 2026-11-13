@@ -9,8 +9,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Source;
 
+/// Pastas do usuário:
+/// - Windows: `%APPDATA%\Linha\config` e `%APPDATA%\Linha\data`
+/// - macOS:   `~/Library/Application Support/Linha`
+/// - Linux:   `~/.config/linha` e `~/.local/share/linha`
 fn dirs() -> ProjectDirs {
-    ProjectDirs::from("app", "linha", "Linha").expect("não foi possível achar a pasta do usuário")
+    let name = if cfg!(any(windows, target_os = "macos")) { "Linha" } else { "linha" };
+    ProjectDirs::from_path(PathBuf::from(name)).expect("não foi possível achar a pasta do usuário")
+}
+
+/// Abre a pasta no gerenciador de arquivos do sistema.
+pub fn reveal(dir: &Path) {
+    let _ = std::fs::create_dir_all(dir);
+    #[cfg(windows)]
+    let cmd = "explorer";
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let cmd = "xdg-open";
+    let _ = std::process::Command::new(cmd).arg(dir).spawn();
 }
 
 pub fn config_dir() -> PathBuf {
@@ -89,11 +106,4 @@ pub struct TokenResponse {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_in: Option<u64>,
-}
-
-/// Erro padrão OAuth 2.0 (`{"error": "...", "error_description": "..."}`).
-#[derive(Debug, Deserialize)]
-pub struct OAuthError {
-    pub error: String,
-    pub error_description: Option<String>,
 }
