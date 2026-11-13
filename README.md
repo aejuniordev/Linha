@@ -140,5 +140,7 @@ src/
 
 `cargo test` roda os testes do leitor iCalendar.
 
+Para lançar uma nova versão, veja [docs/RELEASE.md](docs/RELEASE.md).
+
 A fonte Inter (assets/fonts) é distribuída sob a SIL Open Font License — veja `assets/fonts/LICENSE-Inter.txt`.
 # Linha

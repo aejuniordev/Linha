@@ -1,0 +1,148 @@
+name: Release
+
+# Dispara ao enviar uma tag no formato v1.2.3 (ex.: git tag v0.1.0 && git push origin v0.1.0).
+# Também pode ser rodado à mão em Actions → Release → Run workflow, informando a tag.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag da release (ex.: v0.1.0). Será criada se não existir."
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: linha
+
+jobs:
+  prepare:
+    name: Validar versão
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: tag
+        name: Conferir tag x Cargo.toml
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::A tag $TAG não bate com a versão do Cargo.toml ($CARGO_VERSION)."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependências do Linux (egui/winit)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache do Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Compilar
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Empacotar (Linux/macOS)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          NAME="${BIN_NAME}-${{ needs.prepare.outputs.tag }}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/$NAME/"
+          cp README.md config.example.toml "dist/$NAME/"
+          cp assets/fonts/LICENSE-Inter.txt "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          echo "ASSET=dist/$NAME.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Empacotar (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "$env:BIN_NAME-${{ needs.prepare.outputs.tag }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" "dist/$name/"
+          Copy-Item README.md, config.example.toml, assets/fonts/LICENSE-Inter.txt "dist/$name/"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+          "ASSET=dist/$name.zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Enviar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publicar release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar artefatos
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Criar release no GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Linha ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.tag, '-') }}
+          files: dist/*
+          fail_on_unmatched_files: true

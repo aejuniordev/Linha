@@ -1,0 +1,27 @@
+# Linha — configuração
+# Depois de editar, rode `linha login <outlook|google|icloud>` para cada conta ativa.
+
+[geral]
+dias = 2                  # hoje + amanhã
+intervalo_sync_min = 10   # o daemon sincroniza a cada N minutos
+fechar_apos_seg = 0       # fecha a janela sozinha após N s sem interação (0 = nunca)
+tema = "sistema"          # "sistema", "claro" ou "escuro"
+sempre_no_topo = true
+abrir_ao_iniciar = true   # mostra a linha do tempo quando o daemon inicia (login)
+limiar_sono_seg = 30      # quanto tempo "parado" conta como o computador ter dormido
+cantos_arredondados = true  # false = janela retangular (Linux sem compositor)
+
+[outlook]
+ativo = false
+client_id = ""            # Application (client) ID do app no Microsoft Entra
+tenant = "common"         # "common" = contas pessoais e de trabalho
+
+[google]
+ativo = false
+client_id = ""            # ....apps.googleusercontent.com  (tipo "App para computador")
+client_secret = ""
+
+[icloud]
+ativo = false
+apple_id = ""             # voce@icloud.com
+senha_app = ""            # senha de app: account.apple.com > Entrar e segurança > Senhas de app
