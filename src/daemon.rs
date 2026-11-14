@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{bail, Context, Result};
 
 use crate::config::Config;
-use crate::sync;
+use crate::{sync, update};
 
 /// Porta usada como trava de instância única do daemon.
 const DAEMON_PORT: u16 = 47_613;
@@ -22,20 +22,35 @@ pub const WINDOW_PORT: u16 = 47_614;
 
 const TICK: Duration = Duration::from_secs(5);
 
-pub fn run() -> Result<()> {
+/// `greet`: abre a linha do tempo ao iniciar (se configurado). Falso ao voltar de uma atualização.
+pub fn run(greet: bool) -> Result<()> {
     let _lock = TcpListener::bind(("127.0.0.1", DAEMON_PORT)).context("o daemon do Linha já está rodando")?;
     println!("Linha: daemon ativo. Ctrl+C para sair.");
 
     let mut cfg = Config::load()?;
-    if cfg.geral.abrir_ao_iniciar {
+    if greet && cfg.geral.abrir_ao_iniciar {
         open_window();
     }
     sync::sync_all(&cfg);
 
     let mut last_wall = SystemTime::now();
     let mut last_sync = Instant::now();
+    // primeira verificação de atualização um minuto depois de iniciar
+    let mut next_update = Instant::now() + Duration::from_secs(60);
     loop {
         std::thread::sleep(TICK);
+        if Instant::now() >= next_update {
+            next_update = Instant::now() + update::EVERY;
+            if cfg.geral.atualizar_auto && update::supported() {
+                if let Ok(update::Outcome::Installed(v)) = update::check_and_install() {
+                    println!("Linha {v} instalado; reiniciando o daemon.");
+                    // o novo processo espera este sair (e liberar a trava) antes de começar
+                    if update::relaunch(&["daemon"]).is_ok() {
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
         let now = SystemTime::now();
         let gap = now.duration_since(last_wall).unwrap_or_default();
         last_wall = now;
@@ -87,6 +102,11 @@ pub fn spawn() {
         cmd.creation_flags(DETACHED_PROCESS);
     }
     let _ = cmd.spawn();
+}
+
+/// Já existe um daemon rodando (macOS/Linux)?
+pub fn daemon_running() -> bool {
+    TcpStream::connect_timeout(&([127, 0, 0, 1], DAEMON_PORT).into(), Duration::from_millis(300)).is_ok()
 }
 
 /// Avisa a janela já aberta para aparecer de novo. `true` se havia uma.

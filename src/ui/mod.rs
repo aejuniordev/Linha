@@ -220,6 +220,16 @@ impl LinhaApp {
         if out.close {
             self.close_settings();
         }
+        if out.restart {
+            match &self.shell {
+                Some(sh) => sh.restart(true),
+                None => {
+                    if crate::update::relaunch(&[]).is_ok() {
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
     }
 
     fn open_compose(&mut self) {
@@ -372,6 +382,9 @@ impl eframe::App for LinhaApp {
             match &self.shell {
                 Some(sh) => {
                     sh.hide();
+                    if crate::update::pending().is_some() {
+                        sh.restart(false); // versão nova instalada: troca agora, sem ninguém ver
+                    }
                     self.closing_at = None;
                     self.close_settings();
                     // próximo quadro já nasce transparente, pronto para a próxima entrada

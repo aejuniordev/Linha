@@ -10,6 +10,7 @@ mod providers;
 mod store;
 mod sync;
 mod ui;
+mod update;
 
 use anyhow::{bail, Result};
 
@@ -47,7 +48,14 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // flags internas, usadas quando o Linha se reinicia depois de atualizar
+    let restarted = take_flag(&mut args, "--reiniciado");
+    let hidden = take_flag(&mut args, "--oculto");
+    if restarted {
+        wait_previous(args.first().map(String::as_str) == Some("daemon"));
+    }
+    update::cleanup();
     let arg = |i: usize| args.get(i).map(String::as_str);
 
     match arg(0) {
@@ -56,7 +64,7 @@ fn run() -> Result<()> {
             if daemon::ping_window() {
                 return Ok(());
             }
-            ui::run(Config::load()?, ui::Mode { resident: RESIDENT.then_some(true), ..Default::default() })
+            ui::run(Config::load()?, ui::Mode { resident: RESIDENT.then_some(!hidden), ..Default::default() })
         }
         Some("ajustes" | "config" | "settings") => {
             if daemon::ping_window_with(b"s") {
@@ -75,7 +83,7 @@ fn run() -> Result<()> {
             let show = cfg.geral.abrir_ao_iniciar;
             ui::run(cfg, ui::Mode { resident: Some(show), ..Default::default() })
         }
-        Some("daemon") => daemon::run(),
+        Some("daemon") => daemon::run(!restarted),
         Some("pasta") => {
             println!("configuração: {}", store::config_path().display());
             println!("dados:        {}", store::data_dir().display());
@@ -182,5 +190,21 @@ fn attach_console() {
     }
     unsafe {
         AttachConsole(u32::MAX);
+    }
+}
+
+/// Remove `flag` dos argumentos; devolve se estava lá.
+fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
+    let before = args.len();
+    args.retain(|a| a != flag);
+    args.len() != before
+}
+
+/// Depois de uma atualização, espera o processo antigo liberar as portas (até 15 s).
+fn wait_previous(daemon: bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let busy = || if daemon && !RESIDENT { daemon::daemon_running() } else { daemon::ping_window_with(b"-") };
+    while busy() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }

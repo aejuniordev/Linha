@@ -61,6 +61,7 @@ Usamos [SemVer](https://semver.org/lang/pt-BR/): `MAJOR.MINOR.PATCH`.
    - `linha-v0.2.0-aarch64-apple-darwin.tar.gz` (Mac Apple Silicon)
    - `linha-v0.2.0-x86_64-apple-darwin.tar.gz` (Mac Intel)
    - um `.sha256` para cada arquivo
+   - `linha-<target>` (`.exe` no Windows) com o seu `.sha256`: o executável solto que o atualizador automático baixa. **Não remova**, senão as instalações existentes não se atualizam.
 
    As notas da release são geradas automaticamente a partir dos commits/PRs. Dá para editá-las depois na página da release.
 

@@ -53,6 +53,8 @@ pub struct Geral {
     pub cantos_arredondados: bool,
     /// Registra o daemon para iniciar junto com o sistema.
     pub iniciar_com_sistema: bool,
+    /// Procura novas versões no GitHub e se atualiza sozinho.
+    pub atualizar_auto: bool,
 }
 
 impl Default for Geral {
@@ -67,6 +69,7 @@ impl Default for Geral {
             limiar_sono_seg: 30,
             cantos_arredondados: true,
             iniciar_com_sistema: false,
+            atualizar_auto: true,
         }
     }
 }

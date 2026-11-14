@@ -70,6 +70,10 @@ Ative **Ajustes → Inicialização → Iniciar com o sistema**. Isso registra `
 
 A detecção funciona igual nos três sistemas, sem APIs específicas: uma thread dorme 5 s por vez e, se o relógio de parede andou bem mais do que isso (*Considerar suspensão após*), é porque a máquina estava suspensa. Se a janela já estiver aberta, ela só toca a animação de entrada de novo.
 
+### Atualizações
+
+O Linha procura uma versão nova nas releases do GitHub logo depois de iniciar e a cada 6 horas. Se houver, baixa o executável da sua plataforma, confere o SHA-256 publicado junto e troca o arquivo. No Windows a troca entra em vigor na próxima vez que a janela se esconder ou que você clicar no ícone; no macOS/Linux, o processo em segundo plano reinicia sozinho. Dá para desligar ou procurar na hora em *Ajustes → Atualizações*. Se o Linha estiver numa pasta sem permissão de escrita (ex.: `Arquivos de Programas`), a atualização avisa e não faz nada.
+
 ## Conectar as contas
 
 Em **Ajustes → Contas**:
@@ -107,6 +111,7 @@ src/
   store.rs           pastas do usuário, escrita atômica, tokens
   sync.rs            sincroniza as contas em paralelo
   daemon.rs          segundo plano, detecção de despertar, início automático
+  update.rs          atualização automática pelas releases do GitHub
   demo.rs            agenda de exemplo
   providers/
     oauth.rs         login pelo navegador (authorization code + PKCE, loopback)

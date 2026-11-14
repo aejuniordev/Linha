@@ -13,7 +13,7 @@ use eframe::egui;
 
 use crate::config::Config;
 use crate::model::Cache;
-use crate::sync;
+use crate::{sync, update};
 
 /// Ponte entre a janela, o ícone da bandeja e a thread de fundo.
 pub struct Shell {
@@ -40,6 +40,15 @@ impl Shell {
         self.visible.store(false, Ordering::SeqCst);
         *self.last_hide.lock().unwrap() = Some(Instant::now());
         imp::hide();
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::SeqCst)
+    }
+
+    /// Reinicia já na versão nova (instalada pelo atualizador). Só na thread da janela.
+    pub fn restart(&self, show: bool) {
+        imp::restart(show);
     }
 
     /// Clique no ícone: alterna. Se a janela acabou de sumir por causa deste mesmo
@@ -92,9 +101,20 @@ fn background(shell: Arc<Shell>, incoming: Arc<Mutex<Option<Cache>>>, syncing: A
         };
         let mut last_wall = SystemTime::now();
         let mut last_sync = Instant::now();
+        // primeira verificação de atualização um minuto depois de iniciar
+        let mut next_update = Instant::now() + Duration::from_secs(60);
         loop {
             std::thread::sleep(TICK);
             let cfg = Config::load().unwrap_or_default();
+            if Instant::now() >= next_update {
+                next_update = Instant::now() + update::EVERY;
+                if cfg.geral.atualizar_auto && update::supported() {
+                    // só instala; o reinício acontece no próximo clique no ícone ou ao esconder a janela
+                    if let Err(e) = update::check_and_install() {
+                        eprintln!("atualização: {e:#}");
+                    }
+                }
+            }
             let now = SystemTime::now();
             let gap = now.duration_since(last_wall).unwrap_or_default();
             last_wall = now;
@@ -182,6 +202,10 @@ mod imp {
         let s = shell.clone();
         TrayIconEvent::set_event_handler(Some(move |ev: TrayIconEvent| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = ev {
+                if crate::update::pending().is_some() {
+                    // versão nova instalada: reinicia já, fazendo o que o clique faria (mostrar ou esconder)
+                    restart(!s.is_visible());
+                }
                 s.toggle();
             }
         }));
@@ -197,6 +221,16 @@ mod imp {
                 std::process::exit(0);
             }
         }));
+    }
+
+    /// Tira o ícone, inicia o executável novo e sai. Precisa rodar na thread da janela
+    /// (é onde o ícone vive). Se não conseguir reiniciar, segue rodando.
+    pub fn restart(show: bool) {
+        let args: &[&str] = if show { &[] } else { &["--oculto"] };
+        if crate::update::relaunch(args).is_ok() {
+            TRAY.with(|cell| cell.borrow_mut().take());
+            std::process::exit(0);
+        }
     }
 
     // ---- Win32 mínimo, sem dependências extras ----
@@ -323,6 +357,7 @@ mod imp {
     use std::sync::Arc;
 
     pub fn tray(_shell: Arc<super::Shell>) {}
+    pub fn restart(_show: bool) {}
     pub fn show() {}
     pub fn hide() {}
 }

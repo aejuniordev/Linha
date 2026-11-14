@@ -10,7 +10,7 @@ use super::theme::{fade, font, font_named, Pal, MEDIUM, SEMIBOLD};
 use crate::config::{Config, Principal};
 use crate::model::{CalendarInfo, Source};
 use crate::providers::oauth::Flow;
-use crate::{daemon, providers, store};
+use crate::{daemon, providers, store, update};
 
 const APPLE_APP_PASSWORDS: &str = "https://account.apple.com/account/manage";
 
@@ -29,6 +29,8 @@ pub struct Outcome {
     pub changed: bool,
     /// Uma conta acabou de ser conectada: vale sincronizar já.
     pub sync: bool,
+    /// Versão nova instalada e a pessoa pediu para reiniciar.
+    pub restart: bool,
 }
 
 pub struct Settings {
@@ -38,11 +40,22 @@ pub struct Settings {
     /// Última mensagem por conta: (ok, texto).
     notes: HashMap<Source, (bool, String)>,
     error: Option<String>,
+    /// Verificação manual de atualização em andamento / último resultado.
+    update_job: Option<Arc<Mutex<Option<Result<update::Outcome, String>>>>>,
+    update_note: Option<(bool, String)>,
 }
 
 impl Settings {
     pub fn new(cfg: &Config) -> Settings {
-        Settings { cfg: cfg.clone(), saved: cfg.clone(), pending: None, notes: HashMap::new(), error: None }
+        Settings {
+            cfg: cfg.clone(),
+            saved: cfg.clone(),
+            pending: None,
+            notes: HashMap::new(),
+            error: None,
+            update_job: None,
+            update_note: None,
+        }
     }
 
 
@@ -240,6 +253,9 @@ impl Settings {
                 ui.label(RichText::new(e).color(pal.red).font(font(12.5)));
             }
 
+            section(ui, pal, "Atualizações");
+            card(ui, pal, |ui| self.updates(ui, pal, &ctx, &mut out));
+
             section(ui, pal, "Armazenamento");
             card(ui, pal, |ui| {
                 let dir = store::config_dir();
@@ -420,4 +436,55 @@ pub(super) fn row(ui: &mut Ui, pal: &Pal, label: &str, add: impl FnOnce(&mut Ui)
 
 pub(super) fn hint(ui: &mut Ui, pal: &Pal, text: &str) {
     ui.label(RichText::new(text).font(font(11.5)).color(fade(pal.secondary, 0.9)));
+}
+
+impl Settings {
+    fn updates(&mut self, ui: &mut Ui, pal: &Pal, ctx: &egui::Context, out: &mut Outcome) {
+        // resultado de uma verificação manual
+        if let Some(res) = self.update_job.as_ref().and_then(|j| j.lock().unwrap().take()) {
+            self.update_job = None;
+            self.update_note = Some(match res {
+                Ok(update::Outcome::UpToDate) => (true, format!("Você já está na versão mais recente ({}).", update::CURRENT)),
+                Ok(update::Outcome::Installed(v)) => (true, format!("Versão {v} instalada.")),
+                Err(e) => (false, format!("Não consegui atualizar: {e}")),
+            });
+        }
+
+        ui.checkbox(&mut self.cfg.geral.atualizar_auto, "Atualizar automaticamente");
+        let busy = self.update_job.is_some();
+        ui.horizontal(|ui| {
+            let can = update::supported() && !busy && update::pending().is_none();
+            if ui.add_enabled(can, Button::new("Procurar atualização")).clicked() {
+                let job = Arc::new(Mutex::new(None));
+                let (j, ctx) = (job.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    *j.lock().unwrap() = Some(update::check_and_install().map_err(|e| format!("{e:#}")));
+                    ctx.request_repaint();
+                });
+                self.update_job = Some(job);
+            }
+            if busy {
+                ui.add(egui::Spinner::new().size(14.0));
+            }
+            if update::pending().is_some() {
+                let b = Button::new(RichText::new("Reiniciar agora").color(Color32::WHITE)).fill(pal_blue(pal));
+                if ui.add(b).clicked() {
+                    out.restart = true;
+                }
+            }
+        });
+        if let Some(v) = update::pending() {
+            hint(ui, pal, &format!("A versão {v} já foi baixada e entra em uso quando o Linha reiniciar."));
+        } else if let Some((ok, msg)) = &self.update_note {
+            ui.label(RichText::new(msg).font(font(12.0)).color(if *ok { pal.secondary } else { pal.red }));
+        }
+        if !update::supported() {
+            hint(ui, pal, "Builds de desenvolvimento não se atualizam.");
+        } else {
+            hint(ui, pal, &format!("Versão atual: {}. As novas versões vêm das releases do GitHub.", update::CURRENT));
+        }
+        if busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
 }
