@@ -1,8 +1,12 @@
 //! Curvas de animação.
 
-/// Progresso 0..1 de uma animação que começa em `start + delay` e dura `dur` segundos.
+/// Ritmo geral das animações (1.0 = durações originais; menor = mais rápido).
+pub const PACE: f64 = 0.55;
+
+/// Progresso 0..1 de uma animação que começa em `start + delay` e dura `dur` segundos
+/// (ambos escalados por [`PACE`]).
 pub fn progress(now: f64, start: f64, delay: f64, dur: f64) -> f32 {
-    (((now - start - delay) / dur).clamp(0.0, 1.0)) as f32
+    (((now - start - delay * PACE) / (dur * PACE)).clamp(0.0, 1.0)) as f32
 }
 
 /// Desaceleração suave (parecida com a curva padrão do iOS).

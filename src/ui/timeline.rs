@@ -181,7 +181,7 @@ fn now_line(ui: &mut Ui, v: &View, row: usize, c: &Cols) {
     p.line_segment([pos2(c.rail, y), pos2(x_end, y)], Stroke::new(1.25, fade(red, a)));
 
     // dois "pings" suaves ao abrir
-    let t = v.now - v.opened - 0.8;
+    let t = v.now - v.opened - 0.8 * super::anim::PACE;
     if (0.0..3.2).contains(&t) {
         let k = ((t % 1.6) / 1.6) as f32;
         p.circle_stroke(pos2(c.rail, y), 5.0 + 11.0 * ease(k), Stroke::new(1.5, fade(red, a * (1.0 - k) * 0.55)));
