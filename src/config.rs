@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::model::Source;
 use crate::store;
 
 // IDs dos apps OAuth embutidos no executável na hora do build (veja docs/OAUTH.md).
@@ -19,6 +20,16 @@ pub struct Config {
     pub outlook: OutlookCfg,
     pub google: GoogleCfg,
     pub icloud: ICloudCfg,
+    /// Calendário onde os eventos novos são criados.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<Principal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Principal {
+    pub source: Source,
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

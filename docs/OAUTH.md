@@ -20,7 +20,7 @@ Sem elas o app compila normalmente, mas o botão **Conectar** daquele serviço f
 2. Nome: `Linha`. Tipos de conta: **contas em qualquer diretório organizacional e contas Microsoft pessoais**.
 3. URI de redirecionamento: plataforma **Cliente público/nativo (móvel e área de trabalho)**, valor `http://localhost`.
    (A Microsoft aceita qualquer porta em `http://localhost`; o Linha escolhe uma livre a cada login.)
-4. Em **Permissões de API**, confira *Microsoft Graph → Delegada → `Calendars.Read`* e `offline_access`.
+4. Em **Permissões de API**, adicione *Microsoft Graph → Delegada → `Calendars.ReadWrite`* (ler e criar eventos) e `offline_access`.
 5. Copie o **ID do aplicativo (cliente)** → `LINHA_OUTLOOK_CLIENT_ID`.
 
 Não é preciso criar segredo de cliente: o app é público e usa PKCE.
@@ -30,11 +30,11 @@ Não é preciso criar segredo de cliente: o app é público e usa PKCE.
 ## Google (Google Agenda / Gmail)
 
 1. https://console.cloud.google.com → crie um projeto e ative a **Google Calendar API**.
-2. **Tela de consentimento OAuth**: tipo *Externo*, escopo `.../auth/calendar.readonly`.
+2. **Tela de consentimento OAuth**: tipo *Externo*, escopos `.../auth/calendar.readonly` (ler agendas) e `.../auth/calendar.events` (criar eventos).
 3. **Credenciais → Criar credenciais → ID do cliente OAuth → App para computador**.
 4. Copie o ID e a chave secreta → `LINHA_GOOGLE_CLIENT_ID` e `LINHA_GOOGLE_CLIENT_SECRET`.
 
-> Enquanto o app estiver em modo **Teste**, só os e-mails cadastrados como usuários de teste conseguem entrar, e o login expira a cada 7 dias. Para liberar para todos, publique o app. Como `calendar.readonly` é um escopo sensível, o Google pede uma verificação (política de privacidade, domínio e um vídeo do fluxo de login).
+> Enquanto o app estiver em modo **Teste**, só os e-mails cadastrados como usuários de teste conseguem entrar, e o login expira a cada 7 dias. Para liberar para todos, publique o app. Como esses escopos são sensíveis, o Google pede uma verificação (política de privacidade, domínio e um vídeo do fluxo de login).
 
 ## iCloud
 
@@ -61,3 +61,7 @@ cargo run -- ajustes
 ```
 
 Também dá para testar com apps próprios sem recompilar: preencha `client_id` (e `client_secret`, no Google) nas seções `[outlook]` / `[google]` do `config.toml`. Esses campos, quando preenchidos, têm prioridade sobre os embutidos.
+
+## Permissão de escrita (criar eventos)
+
+Desde que o Linha passou a criar eventos, o login pede permissão de escrita (`Calendars.ReadWrite` na Microsoft, `calendar.events` no Google). Contas conectadas antes disso continuam sincronizando normalmente, mas, para criar eventos, precisam ser conectadas de novo. Os Ajustes mostram um botão **Reconectar** quando isso acontece.

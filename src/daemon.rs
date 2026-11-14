@@ -89,9 +89,30 @@ pub fn spawn() {
     let _ = cmd.spawn();
 }
 
-/// Avisa a janela já aberta para tocar a animação de novo. `true` se havia uma.
+/// Avisa a janela já aberta para aparecer de novo. `true` se havia uma.
 pub fn ping_window() -> bool {
-    TcpStream::connect_timeout(&([127, 0, 0, 1], WINDOW_PORT).into(), Duration::from_millis(300)).is_ok()
+    ping_window_with(b"r")
+}
+
+/// Como [`ping_window`], mandando um pedido (`b"s"` = abrir nos Ajustes).
+pub fn ping_window_with(msg: &[u8]) -> bool {
+    use std::io::Write;
+    #[cfg(windows)]
+    {
+        // deixa a janela do outro processo vir para a frente
+        #[link(name = "user32")]
+        extern "system" {
+            fn AllowSetForegroundWindow(pid: u32) -> i32;
+        }
+        unsafe { AllowSetForegroundWindow(u32::MAX) };
+    }
+    match TcpStream::connect_timeout(&([127, 0, 0, 1], WINDOW_PORT).into(), Duration::from_millis(300)) {
+        Ok(mut s) => {
+            let _ = s.write_all(msg);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------

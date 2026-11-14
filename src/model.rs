@@ -105,11 +105,34 @@ pub struct SyncStatus {
     pub count: usize,
 }
 
+/// Um calendário de uma conta conectada.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CalendarInfo {
+    pub source: Source,
+    /// Identificador no serviço (id do Graph/Google, URL do CalDAV).
+    pub id: String,
+    pub name: String,
+    pub color: [u8; 3],
+    /// Dá para criar eventos nele.
+    pub writable: bool,
+}
+
+/// Evento a ser criado.
+#[derive(Clone, Debug)]
+pub struct NewEvent {
+    pub title: String,
+    pub when: When,
+    pub location: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Cache {
     pub updated: Option<DateTime<Utc>>,
     pub events: Vec<Event>,
     pub status: BTreeMap<Source, SyncStatus>,
+    /// Calendários vistos na última sincronização de cada conta.
+    pub calendars: Vec<CalendarInfo>,
 }
 
 impl Cache {

@@ -34,11 +34,14 @@ pub fn sync_all(cfg: &Config) -> Cache {
     // contas desativadas somem da tela
     cache.events.retain(|e| providers::enabled(cfg, e.source));
     cache.status.retain(|src, _| providers::enabled(cfg, *src));
+    cache.calendars.retain(|c| providers::enabled(cfg, c.source));
 
     for (src, res) in results {
         match res {
-            Ok(events) => {
+            Ok((events, calendars)) => {
                 cache.events.retain(|e| e.source != src);
+                cache.calendars.retain(|c| c.source != src);
+                cache.calendars.extend(calendars);
                 let count = events.len();
                 cache.events.extend(events);
                 cache.status.insert(src, SyncStatus { ok: true, message: None, at: Some(Utc::now()), count });

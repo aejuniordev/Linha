@@ -36,7 +36,15 @@ No Linux, para rodar é preciso ter OpenGL e `libxkbcommon` (já vêm em qualque
 
 Abra o Linha e clique na **engrenagem** (ou em *Abrir Ajustes* na primeira vez). Tudo se configura por lá: contas, quantos dias mostrar, tema, iniciar com o sistema etc. As mudanças são gravadas na hora.
 
-Na janela: **Esc** fecha (nos Ajustes, volta), **Ctrl/Cmd + R** ou **F5** sincroniza, arraste pelo topo para mover. Os botões ⚙ ⟳ × aparecem quando o mouse está sobre a janela.
+Na janela: **Esc** fecha (nos Ajustes e no Novo evento, volta), **Ctrl/Cmd + N** cria um evento, **Ctrl/Cmd + R** ou **F5** sincroniza, arraste pelo topo para mover. O **+** fica no canto esquerdo; os botões ⚙ ⟳ × aparecem quando o mouse está sobre a janela.
+
+### No Windows: área de notificação
+
+No Windows o Linha fica na **área de notificação**, ao lado do relógio. Clique no ícone e a linha do tempo sobe no canto da tela, acima da barra de tarefas, como o calendário do Windows. Clicou fora, ela some. O app fica carregado, então abrir é instantâneo. Clique com o botão direito no ícone para abrir os Ajustes ou sair. Com *Iniciar com o sistema* ligado, o ícone aparece sozinho ao entrar no Windows.
+
+### Criar eventos
+
+Escolha um **calendário principal** em *Ajustes → Calendário principal* (ou na primeira vez que criar um evento). O **+** abre a tela *Novo evento*: título, local, dia (com calendário), horário ou dia inteiro. O evento é criado no principal, mas dá para escolher outro calendário na hora. Funciona com Outlook, Google e iCloud.
 
 Pelo terminal também dá:
 
@@ -66,7 +74,7 @@ A detecção funciona igual nos três sistemas, sem APIs específicas: uma threa
 
 Em **Ajustes → Contas**:
 
-- **Outlook / Microsoft 365 / Hotmail** e **Google Agenda (Gmail)**: clique em **Conectar**. O navegador abre na página de login da Microsoft ou do Google; depois de autorizar, a aba mostra “Pronto ✓” e a conta aparece como conectada. Por baixo é OAuth 2.0 com PKCE e retorno capturado em `127.0.0.1`. O Linha pede só leitura da agenda.
+- **Outlook / Microsoft 365 / Hotmail** e **Google Agenda (Gmail)**: clique em **Conectar**. O navegador abre na página de login da Microsoft ou do Google; depois de autorizar, a aba mostra “Pronto ✓” e a conta aparece como conectada. Por baixo é OAuth 2.0 com PKCE e retorno capturado em `127.0.0.1`. O Linha pede permissão para ler a agenda e criar eventos; ele nunca altera nem apaga o que já existe.
 - **iCloud**: a Apple não oferece login por navegador para agendas. Gere uma **senha de app** em account.apple.com → *Entrar e segurança → Senhas de app* (o link está nos Ajustes), informe o Apple ID e a senha e clique em **Conectar**. O iCloud é lido via CalDAV; eventos recorrentes são expandidos pelo servidor ou, se ele não expandir, localmente (diário, semanal, mensal, anual com `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`, `BYMONTH`, exceções e datas removidas).
 
 Cada conta conectada pode ser escondida da linha do tempo sem desconectar. **Desconectar** apaga os tokens do computador.
@@ -85,7 +93,7 @@ Os botões *Abrir pasta* nos Ajustes levam direto até elas. O `config.toml` é 
 
 ## Privacidade
 
-- Tudo é **somente leitura** e fica na sua máquina. Nenhum servidor intermediário.
+- O Linha lê suas agendas e só escreve quando você cria um evento. Nada passa por servidores intermediários.
 - Tokens OAuth, a configuração e o cache de eventos são gravados com permissão `0600` (Unix).
 - A senha de app do iCloud fica no `config.toml`. Ela pode ser revogada a qualquer momento no site da Apple; *Desconectar* a apaga do computador.
 
@@ -109,6 +117,8 @@ src/
   ui/
     mod.rs           janela, cabeçalho, rodapé, fades de entrada/saída
     settings.rs      tela de Ajustes
+    compose.rs       tela Novo evento
+    shell.rs         Windows: ícone na área de notificação e janela tipo flyout
     timeline.rs      dias, cartões, linha do “agora”, cascata
     theme.rs         cores do iOS, fontes Inter
     anim.rs          curvas de animação

@@ -2,7 +2,9 @@
 
 mod anim;
 mod fmt;
+mod compose;
 mod settings;
+mod shell;
 mod theme;
 mod timeline;
 
@@ -28,7 +30,19 @@ use theme::{fade, font, font_named, Pal, LIGHT, MEDIUM};
 const RADIUS: u8 = 24;
 const FOOTER_H: f32 = 40.0;
 
-pub fn run(cfg: Config, demo: bool, open_settings: bool) -> anyhow::Result<()> {
+/// Como a janela vai se comportar.
+#[derive(Clone, Copy, Default)]
+pub struct Mode {
+    /// Agenda de exemplo.
+    pub demo: bool,
+    /// Abre direto nos Ajustes.
+    pub settings: bool,
+    /// Windows: fica na área de notificação; `Some(true)` = já aparece ao iniciar.
+    pub resident: Option<bool>,
+}
+
+pub fn run(cfg: Config, mode: Mode) -> anyhow::Result<()> {
+    let resident = mode.resident.is_some();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Linha")
         .with_app_id("linha")
@@ -36,12 +50,13 @@ pub fn run(cfg: Config, demo: bool, open_settings: bool) -> anyhow::Result<()> {
         .with_min_inner_size([340.0, 480.0])
         .with_decorations(false)
         .with_transparent(cfg.geral.cantos_arredondados)
-        .with_resizable(true);
-    if cfg.geral.sempre_no_topo {
+        .with_resizable(!resident)
+        .with_taskbar(!resident);
+    if cfg.geral.sempre_no_topo || resident {
         viewport = viewport.with_always_on_top();
     }
-    let options = eframe::NativeOptions { viewport, centered: true, ..Default::default() };
-    eframe::run_native("Linha", options, Box::new(move |cc| Ok(Box::new(LinhaApp::new(cc, cfg, demo, open_settings)))))
+    let options = eframe::NativeOptions { viewport, centered: !resident, ..Default::default() };
+    eframe::run_native("Linha", options, Box::new(move |cc| Ok(Box::new(LinhaApp::new(cc, cfg, mode)))))
         .map_err(|e| anyhow::anyhow!("falha ao abrir a janela: {e}"))
 }
 
@@ -58,35 +73,71 @@ pub struct LinhaApp {
     last_input: f64,
     last_sync: f64,
     settings: Option<settings::Settings>,
+    want_settings: Arc<AtomicBool>,
+    /// Modo residente (bandeja do Windows).
+    shell: Option<Arc<shell::Shell>>,
+    /// Aparecer já ao iniciar (modo residente).
+    show_at_start: bool,
+    first_frame: bool,
+    had_focus: bool,
+    compose: Option<compose::Compose>,
 }
 
 impl LinhaApp {
-    fn new(cc: &eframe::CreationContext<'_>, cfg: Config, demo: bool, open_settings: bool) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, cfg: Config, mode: Mode) -> Self {
+        let demo = mode.demo;
         theme::install_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_theme(theme_pref(&cfg.geral.tema));
 
-        // Escuta pedidos de "aparecer de novo" (vindos do daemon ao despertar).
         let replay = Arc::new(AtomicBool::new(false));
+        let want_settings = Arc::new(AtomicBool::new(false));
+        let incoming: Arc<Mutex<Option<Cache>>> = Arc::default();
+        let syncing: Arc<AtomicBool> = Arc::default();
+        let shell = match mode.resident {
+            Some(_) if !demo => shell::start(&cc.egui_ctx, replay.clone(), want_settings.clone(), incoming.clone(), syncing.clone()),
+            _ => None,
+        };
+
+        // Escuta pedidos de "aparecer" vindos de outro processo (`linha`, daemon).
+        // O primeiro byte diz o que fazer: 's' = abrir nos Ajustes, '-' = nada.
         if let Ok(listener) = TcpListener::bind(("127.0.0.1", WINDOW_PORT)) {
-            let (ctx, flag) = (cc.egui_ctx.clone(), replay.clone());
+            let (ctx, flag, ws, sh) = (cc.egui_ctx.clone(), replay.clone(), want_settings.clone(), shell.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
-                    if stream.is_ok() {
-                        flag.store(true, Ordering::SeqCst);
-                        ctx.request_repaint();
+                    let Ok(mut stream) = stream else { continue };
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                    let mut b = [0u8; 1];
+                    let _ = std::io::Read::read(&mut stream, &mut b);
+                    match b[0] {
+                        b'-' => continue, // só conferindo se já estamos rodando
+                        b's' => ws.store(true, Ordering::SeqCst),
+                        _ => {}
+                    }
+                    match &sh {
+                        Some(sh) => sh.reveal(),
+                        None => {
+                            flag.store(true, Ordering::SeqCst);
+                            ctx.request_repaint();
+                        }
                     }
                 }
             });
         }
 
-        let panel = open_settings.then(|| settings::Settings::new(&cfg));
+        let panel = mode.settings.then(|| settings::Settings::new(&cfg));
         let mut app = LinhaApp {
             cache: if demo { demo::cache() } else { Cache::load() },
             cfg,
             demo,
-            incoming: Arc::default(),
-            syncing: Arc::default(),
+            incoming,
+            syncing,
             replay,
+            want_settings,
+            shell,
+            show_at_start: mode.resident.unwrap_or(true) || mode.settings,
+            first_frame: true,
+            had_focus: false,
+            compose: None,
             opened_at: None,
             first_seen: HashMap::new(),
             closing_at: None,
@@ -124,6 +175,7 @@ impl LinhaApp {
     }
 
     fn open_settings(&mut self) {
+        self.compose = None;
         if self.settings.is_none() {
             self.settings = Some(settings::Settings::new(&self.cfg));
         }
@@ -151,10 +203,11 @@ impl LinhaApp {
         }
         let area = Rect::from_min_max(pos2(rect.left() + 20.0, rect.top() + 22.0), pos2(rect.right() - 20.0, rect.bottom() - 8.0));
         let Some(panel) = self.settings.as_mut() else { return };
+        let cals = &self.cache.calendars;
         let out = ui
             .scope_builder(UiBuilder::new().max_rect(area), |ui| {
                 ui.multiply_opacity(alpha);
-                panel.show(ui, pal)
+                panel.show(ui, pal, cals)
             })
             .inner;
         if out.changed {
@@ -166,6 +219,43 @@ impl LinhaApp {
         }
         if out.close {
             self.close_settings();
+        }
+    }
+
+    fn open_compose(&mut self) {
+        if !self.demo && self.cfg.any_enabled() && self.compose.is_none() {
+            self.close_settings();
+            self.compose = Some(compose::Compose::new(&self.cfg, Local::now().date_naive()));
+        }
+    }
+
+    /// Tela "Novo evento", ocupando a janela toda.
+    fn compose_page(&mut self, ui: &mut egui::Ui, rect: Rect, pal: &Pal, alpha: f32, now: f64) {
+        let ctx = ui.ctx().clone();
+        let top = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 64.0));
+        if ui.interact(top, Id::unique("arrastar-novo"), Sense::click_and_drag()).drag_started() {
+            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+        }
+        let area = Rect::from_min_max(pos2(rect.left() + 20.0, rect.top() + 22.0), pos2(rect.right() - 20.0, rect.bottom() - 8.0));
+        let Some(page) = self.compose.as_mut() else { return };
+        let (cfg, cals) = (&self.cfg, &self.cache.calendars);
+        let out = ui
+            .scope_builder(UiBuilder::new().max_rect(area), |ui| {
+                ui.multiply_opacity(alpha);
+                page.show(ui, pal, cfg, cals)
+            })
+            .inner;
+        if let Some(p) = out.principal {
+            self.cfg.principal = Some(p);
+            if let Err(e) = self.cfg.save() {
+                eprintln!("não consegui gravar o calendário principal: {e:#}");
+            }
+        }
+        if out.saved {
+            self.start_sync(&ctx, true, now);
+        }
+        if out.close {
+            self.compose = None;
         }
     }
 }
@@ -188,11 +278,25 @@ impl eframe::App for LinhaApp {
         let now = ctx.input(|i| i.time);
         let opened = *self.opened_at.get_or_insert(now);
 
+        if std::mem::take(&mut self.first_frame) {
+            if let Some(sh) = &self.shell {
+                if self.show_at_start {
+                    sh.reveal();
+                } else {
+                    sh.hide();
+                }
+            }
+        }
+        if self.want_settings.swap(false, Ordering::SeqCst) && !self.demo {
+            self.open_settings();
+        }
+
         if self.replay.swap(false, Ordering::SeqCst) {
             self.opened_at = Some(now);
             self.first_seen.clear();
             self.closing_at = None;
             self.last_input = now;
+            self.had_focus = false;
             ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
             self.start_sync(&ctx, false, now);
@@ -209,18 +313,24 @@ impl eframe::App for LinhaApp {
             self.cache = new;
         }
 
-        let (esc, refresh, active) = ctx.input(|i| {
+        let (esc, refresh, new_event, active) = ctx.input(|i| {
             (
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::F5) || (i.modifiers.command && i.key_pressed(Key::R)),
+                i.modifiers.command && i.key_pressed(Key::N),
                 i.pointer.is_moving() || !i.events.is_empty(),
             )
         });
+        if new_event {
+            self.open_compose();
+        }
         if active {
             self.last_input = now;
         }
         if esc {
-            if self.settings.is_some() {
+            if self.compose.is_some() {
+                self.compose = None;
+            } else if self.settings.is_some() {
                 self.close_settings();
             } else {
                 self.close(now);
@@ -230,23 +340,51 @@ impl eframe::App for LinhaApp {
             self.start_sync(&ctx, true, now);
         }
         let auto_close = self.cfg.geral.fechar_apos_seg as f64;
-        if auto_close > 0.0 && self.settings.is_none() && now - self.last_input.max(opened) > auto_close {
+        if auto_close > 0.0 && self.settings.is_none() && self.compose.is_none() && now - self.last_input.max(opened) > auto_close {
             self.close(now);
         }
-        if now - self.last_sync > (self.cfg.geral.intervalo_sync_min.max(1) * 60) as f64 {
+        // no modo residente quem sincroniza de tempos em tempos é a thread de fundo
+        if self.shell.is_none() && now - self.last_sync > (self.cfg.geral.intervalo_sync_min.max(1) * 60) as f64 {
             self.start_sync(&ctx, false, now);
         }
 
-        // ---- opacidade global: entra com fade, sai com fade ----
+        if self.shell.is_some() {
+            // Alt+F4 e afins só escondem; sair é pelo menu do ícone
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.close(now);
+            }
+            // como o calendário do Windows: clicou fora, some
+            match ctx.input(|i| i.viewport().focused) {
+                Some(true) => self.had_focus = true,
+                Some(false) if self.had_focus && self.settings.is_none() && self.compose.is_none() && self.closing_at.is_none() => {
+                    self.had_focus = false;
+                    self.close(now);
+                }
+                _ => {}
+            }
+        }
+
+        // ---- opacidade global: entra com fade e sobe um pouco; sai com fade ----
         let appear = ease(progress(now, opened, 0.0, 0.42));
         let vanish = self.closing_at.map(|t| ease_in(progress(now, t, 0.0, 0.24))).unwrap_or(0.0);
         if self.closing_at.is_some() && vanish >= 1.0 {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+            match &self.shell {
+                Some(sh) => {
+                    sh.hide();
+                    self.closing_at = None;
+                    self.close_settings();
+                    // próximo quadro já nasce transparente, pronto para a próxima entrada
+                    self.opened_at = Some(f64::INFINITY);
+                }
+                None => ctx.send_viewport_cmd(ViewportCommand::Close),
+            }
         }
         let alpha = appear * (1.0 - vanish);
         let pal = if ctx.theme() == Theme::Dark { Pal::dark() } else { Pal::light() };
 
-        let rect = ui.max_rect();
+        let slide = if self.shell.is_some() { (1.0 - appear) * 18.0 } else { 0.0 };
+        let rect = ui.max_rect().translate(vec2(0.0, slide));
         let radius = if self.cfg.geral.cantos_arredondados { RADIUS } else { 0 };
         // janela opaca não tem como "sumir" no fundo da tela: aí só o conteúdo faz fade
         let bg_alpha = if radius > 0 { alpha } else { 1.0 };
@@ -259,9 +397,16 @@ impl eframe::App for LinhaApp {
             }
         }
 
+        if self.compose.is_some() {
+            self.compose_page(ui, rect, &pal, alpha, now);
+            if self.closing_at.is_some() || (0.0..1.0).contains(&(now - opened)) {
+                ctx.request_repaint();
+            }
+            return;
+        }
         if self.settings.is_some() {
             self.settings_page(ui, rect, &pal, alpha, now);
-            if self.closing_at.is_some() || now - opened < 1.0 {
+            if self.closing_at.is_some() || (0.0..1.0).contains(&(now - opened)) {
                 ctx.request_repaint();
             }
             return;
@@ -300,7 +445,7 @@ impl eframe::App for LinhaApp {
 
         // ---- quando repintar ----
         let recent = self.first_seen.values().any(|t| now - t < 1.2);
-        if now - opened < 5.0 || self.closing_at.is_some() || recent || self.syncing.load(Ordering::SeqCst) {
+        if (0.0..5.0).contains(&(now - opened)) || self.closing_at.is_some() || recent || self.syncing.load(Ordering::SeqCst) {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(1000));
@@ -383,6 +528,23 @@ impl LinhaApp {
                 p.line_segment([gc + d * 5.0, gc + d * 7.2], Stroke::new(2.0, ink));
             }
         }
+
+        // "+" (novo evento), sempre visível no canto esquerdo
+        if !self.demo && self.cfg.any_enabled() {
+            let plus_r = Rect::from_center_size(pos2(rect.left() + 26.0, rect.top() + 24.0), vec2(26.0, 26.0));
+            let resp = ui.interact(plus_r, Id::unique("novo-evento"), Sense::click()).on_hover_text("Novo evento (Ctrl+N)");
+            let h = ctx.animate_bool(resp.id, resp.hovered());
+            let blue = if pal.dark { Color32::from_rgb(10, 132, 255) } else { Color32::from_rgb(0, 122, 255) };
+            let p = ui.painter();
+            p.circle_filled(plus_r.center(), 13.0, fade(blue, alpha * (0.14 + 0.12 * h)));
+            let (pc, k) = (plus_r.center(), 5.5);
+            p.line_segment([pc + vec2(-k, 0.0), pc + vec2(k, 0.0)], Stroke::new(1.8, fade(blue, alpha)));
+            p.line_segment([pc + vec2(0.0, -k), pc + vec2(0.0, k)], Stroke::new(1.8, fade(blue, alpha)));
+            if resp.clicked() {
+                self.open_compose();
+            }
+        }
+        let p = ui.painter();
 
         // data
         let local = Local::now();

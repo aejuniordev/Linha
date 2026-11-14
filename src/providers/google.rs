@@ -9,10 +9,12 @@ use url::Url;
 use super::oauth::{self, Flow};
 use super::{check, client};
 use crate::config::GoogleCfg;
-use crate::model::{parse_hex_color, Event, Source, When, DEFAULT_COLOR};
+use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Source, When, DEFAULT_COLOR};
 use crate::store::{TokenResponse, Tokens};
 
-const SCOPE: &str = "https://www.googleapis.com/auth/calendar.readonly";
+/// Ler agendas e criar eventos.
+const SCOPE: &str = "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events";
+const WRITE_SCOPE: &str = "auth/calendar.events";
 const AUTH: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN: &str = "https://oauth2.googleapis.com/token";
 const API: &str = "https://www.googleapis.com/calendar/v3";
@@ -49,7 +51,9 @@ pub fn login(cfg: &GoogleCfg, flow: &Flow) -> Result<()> {
         .send()
         .context("Google: sem conexão com o servidor")?;
     let tr: TokenResponse = check(resp, "Google (trocar código)")?.json()?;
-    Tokens::from_response(&tr, None).save(Source::Google)
+    let mut t = Tokens::from_response(&tr, None);
+    t.scope.get_or_insert_with(|| SCOPE.into());
+    t.save(Source::Google)
 }
 
 fn access_token(cfg: &GoogleCfg) -> Result<String> {
@@ -69,7 +73,7 @@ fn access_token(cfg: &GoogleCfg) -> Result<String> {
         ])
         .send().context("Google: sem conexão com o servidor")?;
     let tr: TokenResponse = check(resp, "Google (renovar sessão)")?.json()?;
-    let t = Tokens::from_response(&tr, Some(refresh));
+    let t = Tokens::from_response(&tr, Some(&tokens));
     t.save(Source::Google)?;
     Ok(t.access_token)
 }
@@ -90,6 +94,7 @@ struct CalEntry {
     background_color: Option<String>,
     selected: Option<bool>,
     hidden: Option<bool>,
+    access_role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -141,7 +146,7 @@ fn parse_when(start: &GTime, end: &GTime) -> Result<When> {
     Ok(When::AllDay { start: s, end: e })
 }
 
-pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Event>> {
+pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(Vec<Event>, Vec<CalendarInfo>)> {
     let token = access_token(cfg)?;
     let http = client();
 
@@ -161,9 +166,17 @@ pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
     }
 
     let mut out = Vec::new();
+    let mut infos = Vec::new();
     for cal in cals.into_iter().filter(|c| c.selected != Some(false) && c.hidden != Some(true)) {
         let color = cal.background_color.as_deref().and_then(parse_hex_color).unwrap_or(DEFAULT_COLOR);
         let cal_name = cal.summary_override.or(cal.summary).unwrap_or_else(|| "Google".into());
+        infos.push(CalendarInfo {
+            source: Source::Google,
+            id: cal.id.clone(),
+            name: cal_name.clone(),
+            color,
+            writable: matches!(cal.access_role.as_deref(), Some("owner" | "writer")),
+        });
         let mut url = Url::parse(API)?;
         url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["calendars", cal.id.as_str(), "events"]);
 
@@ -203,5 +216,37 @@ pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
             }
         }
     }
-    Ok(out)
+    Ok((out, infos))
+}
+
+/// O login atual permite criar eventos?
+pub fn can_write() -> bool {
+    Tokens::load(Source::Google).is_some_and(|t| t.has_scope(WRITE_SCOPE))
+}
+
+/// Cria um evento no calendário `calendar_id`.
+pub fn create(cfg: &GoogleCfg, calendar_id: &str, ev: &NewEvent) -> Result<()> {
+    if !can_write() {
+        anyhow::bail!("Google: conecte a conta de novo em Ajustes para permitir criar eventos");
+    }
+    let token = access_token(cfg)?;
+    let (start, end) = match &ev.when {
+        When::Timed { start, end } => (
+            serde_json::json!({ "dateTime": start.to_rfc3339() }),
+            serde_json::json!({ "dateTime": end.to_rfc3339() }),
+        ),
+        When::AllDay { start, end } => (
+            serde_json::json!({ "date": start.to_string() }),
+            serde_json::json!({ "date": end.to_string() }),
+        ),
+    };
+    let mut body = serde_json::json!({ "summary": ev.title, "start": start, "end": end });
+    if let Some(l) = &ev.location {
+        body["location"] = serde_json::json!(l);
+    }
+    let mut url = Url::parse(API)?;
+    url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["calendars", calendar_id, "events"]);
+    let resp = client().post(url).bearer_auth(&token).json(&body).send().context("Google: sem conexão com o servidor")?;
+    check(resp, "Google (criar evento)")?;
+    Ok(())
 }

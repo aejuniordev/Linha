@@ -16,6 +16,9 @@ use anyhow::{bail, Result};
 use config::Config;
 use model::{Source, When};
 
+/// No Windows o Linha fica na área de notificação; nos outros sistemas, janela + daemon.
+const RESIDENT: bool = cfg!(windows);
+
 const HELP: &str = "\
 Linha — a linha do tempo do seu dia
 
@@ -49,14 +52,29 @@ fn run() -> Result<()> {
 
     match arg(0) {
         None => {
-            // já existe uma janela aberta? só pede para ela reaparecer
+            // já existe uma janela aberta (ou o Linha está na bandeja)? só pede para aparecer
             if daemon::ping_window() {
                 return Ok(());
             }
-            ui::run(Config::load()?, false, false)
+            ui::run(Config::load()?, ui::Mode { resident: RESIDENT.then_some(true), ..Default::default() })
         }
-        Some("ajustes" | "config" | "settings") => ui::run(Config::load().unwrap_or_default(), false, true),
-        Some("demo") => ui::run(Config::load().unwrap_or_default(), true, false),
+        Some("ajustes" | "config" | "settings") => {
+            if daemon::ping_window_with(b"s") {
+                return Ok(());
+            }
+            let mode = ui::Mode { settings: true, resident: RESIDENT.then_some(true), ..Default::default() };
+            ui::run(Config::load().unwrap_or_default(), mode)
+        }
+        Some("demo") => ui::run(Config::load().unwrap_or_default(), ui::Mode { demo: true, ..Default::default() }),
+        Some("daemon") if RESIDENT => {
+            // no Windows o "daemon" é o próprio Linha na área de notificação
+            if daemon::ping_window_with(b"-") {
+                return Ok(()); // já está rodando; não precisa aparecer
+            }
+            let cfg = Config::load().unwrap_or_default();
+            let show = cfg.geral.abrir_ao_iniciar;
+            ui::run(cfg, ui::Mode { resident: Some(show), ..Default::default() })
+        }
         Some("daemon") => daemon::run(),
         Some("pasta") => {
             println!("configuração: {}", store::config_path().display());

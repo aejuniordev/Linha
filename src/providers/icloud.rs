@@ -8,7 +8,7 @@ use url::Url;
 
 use super::{check, client, ics};
 use crate::config::ICloudCfg;
-use crate::model::{parse_hex_color, Event, Source, DEFAULT_COLOR};
+use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Source, When, DEFAULT_COLOR};
 
 const ROOT: &str = "https://caldav.icloud.com/";
 const NS_DAV: &str = "DAV:";
@@ -121,7 +121,7 @@ fn discover(dav: &Dav) -> Result<Vec<CalInfo>> {
     Ok(cals)
 }
 
-pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Event>> {
+pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(Vec<Event>, Vec<CalendarInfo>)> {
     if cfg.apple_id.trim().is_empty() || cfg.senha_app.trim().is_empty() {
         bail!("iCloud: conecte a conta em Ajustes (Apple ID + senha de app)");
     }
@@ -138,7 +138,12 @@ pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
     );
 
     let mut out = Vec::new();
-    for cal in discover(&dav)? {
+    let cals = discover(&dav)?;
+    let infos = cals
+        .iter()
+        .map(|c| CalendarInfo { source: Source::ICloud, id: c.url.to_string(), name: c.name.clone(), color: c.color, writable: true })
+        .collect();
+    for cal in cals {
         let xml = dav.request("REPORT", &cal.url, "1", query.clone())?;
         let doc = roxmltree::Document::parse(&xml).context("iCloud: XML inválido")?;
         let mut vevents = Vec::new();
@@ -149,7 +154,7 @@ pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
         }
         out.extend(ics::expand(&vevents, from, to, &cal.name, cal.color, Source::ICloud));
     }
-    Ok(out)
+    Ok((out, infos))
 }
 
 /// Testa as credenciais. Devolve os nomes dos calendários encontrados.
@@ -159,4 +164,93 @@ pub fn login(cfg: &ICloudCfg) -> Result<Vec<String>> {
     }
     let dav = Dav { http: client(), cfg };
     Ok(discover(&dav)?.into_iter().map(|c| c.name).collect())
+}
+
+/// Cria um evento no calendário cujo endereço CalDAV é `calendar_url`.
+pub fn create(cfg: &ICloudCfg, calendar_url: &str, ev: &NewEvent) -> Result<()> {
+    use rand::distr::{Alphanumeric, SampleString};
+
+    if cfg.apple_id.trim().is_empty() || cfg.senha_app.trim().is_empty() {
+        bail!("iCloud: conecte a conta em Ajustes (Apple ID + senha de app)");
+    }
+    let base = Url::parse(calendar_url).context("iCloud: endereço de calendário inválido")?;
+    let uid = format!("{}@linha", Alphanumeric.sample_string(&mut rand::rng(), 32).to_ascii_lowercase());
+    let url = base.join(&format!("{uid}.ics"))?;
+
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let (start, end) = match &ev.when {
+        When::Timed { start, end } => (
+            format!("DTSTART:{}", start.format("%Y%m%dT%H%M%SZ")),
+            format!("DTEND:{}", end.format("%Y%m%dT%H%M%SZ")),
+        ),
+        When::AllDay { start, end } => (
+            format!("DTSTART;VALUE=DATE:{}", start.format("%Y%m%d")),
+            format!("DTEND;VALUE=DATE:{}", end.format("%Y%m%d")),
+        ),
+    };
+    let mut lines = vec![
+        "BEGIN:VCALENDAR".to_string(),
+        "VERSION:2.0".into(),
+        "PRODID:-//Linha//Linha//PT-BR".into(),
+        "BEGIN:VEVENT".into(),
+        format!("UID:{uid}"),
+        format!("DTSTAMP:{stamp}"),
+        start,
+        end,
+        format!("SUMMARY:{}", ics_text(&ev.title)),
+    ];
+    if let Some(l) = &ev.location {
+        lines.push(format!("LOCATION:{}", ics_text(l)));
+    }
+    lines.extend(["END:VEVENT".into(), "END:VCALENDAR".into()]);
+    let body: String = lines.iter().map(|l| fold(l) + "\r\n").collect();
+
+    let resp = client()
+        .put(url)
+        .basic_auth(cfg.apple_id.trim(), Some(cfg.senha_app.trim()))
+        .header("Content-Type", "text/calendar; charset=utf-8")
+        .header("If-None-Match", "*")
+        .body(body)
+        .send()
+        .context("iCloud: sem conexão com o servidor")?;
+    if resp.status().as_u16() == 401 {
+        bail!("iCloud: Apple ID ou senha de app incorretos");
+    }
+    check(resp, "iCloud (criar evento)")?;
+    Ok(())
+}
+
+/// Escapa texto para iCalendar (RFC 5545 §3.3.11).
+fn ics_text(s: &str) -> String {
+    s.replace('\\', r"\\").replace(';', r"\;").replace(',', r"\,").replace("\r\n", r"\n").replace('\n', r"\n")
+}
+
+/// Quebra linhas longas em 75 bytes, sem partir caracteres UTF-8 (RFC 5545 §3.1).
+fn fold(line: &str) -> String {
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut width = 0;
+    for ch in line.chars() {
+        let n = ch.len_utf8();
+        if width + n > 75 {
+            out.push_str("\r\n ");
+            width = 1;
+        }
+        out.push(ch);
+        width += n;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapa_e_dobra() {
+        assert_eq!(ics_text("a,b;c\\d\ne"), r"a\,b\;c\\d\ne");
+        let long = format!("SUMMARY:{}", "ã".repeat(60));
+        let folded = fold(&long);
+        assert!(folded.split("\r\n").all(|l| l.len() <= 75));
+        assert_eq!(folded.replace("\r\n ", ""), long);
+    }
 }

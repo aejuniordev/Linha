@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use reqwest::blocking::{Client, Response};
 
 use crate::config::Config;
-use crate::model::{Event, Source};
+use crate::model::{CalendarInfo, Event, NewEvent, Source};
 
 pub fn client() -> Client {
     Client::builder()
@@ -23,12 +23,31 @@ pub fn client() -> Client {
         .expect("cliente HTTP")
 }
 
-/// Busca eventos de uma origem no intervalo [from, to).
-pub fn fetch(cfg: &Config, src: Source, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Event>> {
+/// Busca eventos (e a lista de calendários) de uma origem no intervalo [from, to).
+pub fn fetch(cfg: &Config, src: Source, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(Vec<Event>, Vec<CalendarInfo>)> {
     match src {
         Source::Outlook => outlook::fetch(&cfg.outlook, from, to),
         Source::Google => google::fetch(&cfg.google, from, to),
         Source::ICloud => icloud::fetch(&cfg.icloud, from, to),
+    }
+}
+
+/// Cria um evento num calendário.
+pub fn create(cfg: &Config, src: Source, calendar_id: &str, ev: &NewEvent) -> Result<()> {
+    match src {
+        Source::Outlook => outlook::create(&cfg.outlook, calendar_id, ev),
+        Source::Google => google::create(&cfg.google, calendar_id, ev),
+        Source::ICloud => icloud::create(&cfg.icloud, calendar_id, ev),
+    }
+}
+
+/// O login desta conta permite criar eventos? (Outlook e Google pedem permissão
+/// de escrita; logins antigos, só de leitura, precisam conectar de novo.)
+pub fn can_write(src: Source) -> bool {
+    match src {
+        Source::Outlook => outlook::can_write(),
+        Source::Google => google::can_write(),
+        Source::ICloud => true,
     }
 }
 

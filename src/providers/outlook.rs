@@ -8,10 +8,13 @@ use serde::Deserialize;
 use super::oauth::{self, Flow};
 use super::{check, client};
 use crate::config::OutlookCfg;
-use crate::model::{parse_hex_color, Event, Source, When, DEFAULT_COLOR};
+use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Source, When, DEFAULT_COLOR};
 use crate::store::{TokenResponse, Tokens};
 
-const SCOPE: &str = "offline_access Calendars.Read";
+/// Ler e criar eventos.
+const SCOPE: &str = "offline_access Calendars.ReadWrite";
+/// Escopo dos logins feitos antes da escrita existir (o refresh não pode pedir mais que isso).
+const LEGACY_SCOPE: &str = "offline_access Calendars.Read";
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 
 fn endpoint(cfg: &OutlookCfg, what: &str) -> String {
@@ -47,7 +50,9 @@ pub fn login(cfg: &OutlookCfg, flow: &Flow) -> Result<()> {
         .send()
         .context("Outlook: sem conexão com o servidor")?;
     let tr: TokenResponse = check(resp, "Outlook (trocar código)")?.json()?;
-    Tokens::from_response(&tr, None).save(Source::Outlook)
+    let mut t = Tokens::from_response(&tr, None);
+    t.scope.get_or_insert_with(|| SCOPE.into());
+    t.save(Source::Outlook)
 }
 
 fn access_token(cfg: &OutlookCfg) -> Result<String> {
@@ -63,11 +68,11 @@ fn access_token(cfg: &OutlookCfg) -> Result<String> {
             ("grant_type", "refresh_token"),
             ("client_id", id.as_str()),
             ("refresh_token", refresh.as_str()),
-            ("scope", SCOPE),
+            ("scope", refresh_scope(&tokens)),
         ])
         .send().context("Outlook: sem conexão com o servidor")?;
     let tr: TokenResponse = check(resp, "Outlook (renovar sessão)")?.json()?;
-    let t = Tokens::from_response(&tr, Some(refresh));
+    let t = Tokens::from_response(&tr, Some(&tokens));
     t.save(Source::Outlook)?;
     Ok(t.access_token)
 }
@@ -86,6 +91,7 @@ struct Calendar {
     name: Option<String>,
     hex_color: Option<String>,
     color: Option<String>,
+    can_edit: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -146,7 +152,7 @@ fn date_part(s: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(s.get(..10).unwrap_or(s), "%Y-%m-%d").with_context(|| format!("data inválida: {s}"))
 }
 
-pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Event>> {
+pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(Vec<Event>, Vec<CalendarInfo>)> {
     let token = access_token(cfg)?;
     let http = client();
     let get = |url: &str| -> Result<reqwest::blocking::Response> {
@@ -159,9 +165,10 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
         )
     };
 
-    let cals: Page<Calendar> = get(&format!("{GRAPH}/me/calendars?$select=id,name,hexColor,color&$top=100"))?.json()?;
+    let cals: Page<Calendar> = get(&format!("{GRAPH}/me/calendars?$select=id,name,hexColor,color,canEdit&$top=100"))?.json()?;
     let fmt = "%Y-%m-%dT%H:%M:%SZ";
     let mut out = Vec::new();
+    let mut infos = Vec::new();
 
     for cal in cals.value {
         let color = cal
@@ -170,6 +177,13 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
             .and_then(parse_hex_color)
             .unwrap_or_else(|| named_color(cal.color.as_deref().unwrap_or("")));
         let cal_name = cal.name.unwrap_or_else(|| "Outlook".into());
+        infos.push(CalendarInfo {
+            source: Source::Outlook,
+            id: cal.id.clone(),
+            name: cal_name.clone(),
+            color,
+            writable: cal.can_edit.unwrap_or(true),
+        });
         let mut url = Some(format!(
             "{GRAPH}/me/calendars/{}/calendarView?startDateTime={}&endDateTime={}&$top=200\
              &$select=id,subject,start,end,isAllDay,isCancelled,location,responseStatus",
@@ -205,5 +219,45 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
             url = page.next;
         }
     }
-    Ok(out)
+    Ok((out, infos))
+}
+
+fn refresh_scope(tokens: &Tokens) -> &'static str {
+    if tokens.has_scope("Calendars.ReadWrite") {
+        SCOPE
+    } else {
+        LEGACY_SCOPE
+    }
+}
+
+/// O login atual permite criar eventos?
+pub fn can_write() -> bool {
+    Tokens::load(Source::Outlook).is_some_and(|t| t.has_scope("Calendars.ReadWrite"))
+}
+
+/// Cria um evento no calendário `calendar_id`.
+pub fn create(cfg: &OutlookCfg, calendar_id: &str, ev: &NewEvent) -> Result<()> {
+    if !can_write() {
+        anyhow::bail!("Outlook: conecte a conta de novo em Ajustes para permitir criar eventos");
+    }
+    let token = access_token(cfg)?;
+    let fmt = "%Y-%m-%dT%H:%M:%S";
+    let (start, end, all_day) = match &ev.when {
+        When::Timed { start, end } => (start.format(fmt).to_string(), end.format(fmt).to_string(), false),
+        When::AllDay { start, end } => (format!("{start}T00:00:00"), format!("{end}T00:00:00"), true),
+    };
+    let mut body = serde_json::json!({
+        "subject": ev.title,
+        "isAllDay": all_day,
+        "start": { "dateTime": start, "timeZone": "UTC" },
+        "end": { "dateTime": end, "timeZone": "UTC" },
+    });
+    if let Some(l) = &ev.location {
+        body["location"] = serde_json::json!({ "displayName": l });
+    }
+    let mut url = url::Url::parse(GRAPH)?;
+    url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["me", "calendars", calendar_id, "events"]);
+    let resp = client().post(url).bearer_auth(&token).json(&body).send().context("Outlook: sem conexão com o servidor")?;
+    check(resp, "Outlook (criar evento)")?;
+    Ok(())
 }

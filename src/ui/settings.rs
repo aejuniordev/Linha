@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, Align, Button, Color32, CornerRadius, Layout, Margin, RichText, Ui};
 
 use super::theme::{fade, font, font_named, Pal, MEDIUM, SEMIBOLD};
-use crate::config::Config;
-use crate::model::Source;
+use crate::config::{Config, Principal};
+use crate::model::{CalendarInfo, Source};
 use crate::providers::oauth::Flow;
 use crate::{daemon, providers, store};
 
@@ -45,9 +45,6 @@ impl Settings {
         Settings { cfg: cfg.clone(), saved: cfg.clone(), pending: None, notes: HashMap::new(), error: None }
     }
 
-    pub fn busy(&self) -> bool {
-        self.pending.is_some()
-    }
 
     /// Cancela um login em andamento (ao fechar a tela).
     pub fn cancel(&mut self) {
@@ -122,7 +119,7 @@ impl Settings {
         }
     }
 
-    pub fn show(&mut self, ui: &mut Ui, pal: &Pal) -> Outcome {
+    pub fn show(&mut self, ui: &mut Ui, pal: &Pal, calendars: &[CalendarInfo]) -> Outcome {
         let mut out = Outcome::default();
         self.poll(&mut out);
         let ctx = ui.ctx().clone();
@@ -145,6 +142,42 @@ impl Settings {
             self.account(ui, pal, &ctx, Source::Outlook, "Microsoft 365, Outlook.com e Hotmail");
             self.account(ui, pal, &ctx, Source::Google, "Google Agenda / Gmail");
             self.account(ui, pal, &ctx, Source::ICloud, "Agenda do iPhone, iPad e Mac");
+
+            section(ui, pal, "Calendário principal");
+            card(ui, pal, |ui| {
+                let writable: Vec<&CalendarInfo> =
+                    calendars.iter().filter(|c| c.writable && providers::enabled(&self.cfg, c.source)).collect();
+                if writable.is_empty() {
+                    hint(ui, pal, "Conecte uma conta e sincronize para escolher onde os eventos novos serão criados.");
+                } else {
+                    let current = self.cfg.principal.as_ref().map(|p| format!("{} · {}", p.name, p.source.label()));
+                    egui::ComboBox::from_id_salt("principal")
+                        .selected_text(current.unwrap_or_else(|| "Escolha…".into()))
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for c in &writable {
+                                let sel = self.cfg.principal.as_ref().is_some_and(|p| p.source == c.source && p.id == c.id);
+                                if ui.selectable_label(sel, format!("{} · {}", c.name, c.source.label())).clicked() {
+                                    self.cfg.principal =
+                                        Some(Principal { source: c.source, id: c.id.clone(), name: c.name.clone() });
+                                }
+                            }
+                        });
+                    hint(ui, pal, "Os eventos criados pelo botão + vão para este calendário.");
+                }
+                // logins antigos (só leitura) precisam conectar de novo para escrever
+                for src in [Source::Outlook, Source::Google] {
+                    if self.connected(src) && !providers::can_write(src) {
+                        let waiting = self.pending.as_ref().is_some_and(|p| p.src == src);
+                        ui.horizontal(|ui| {
+                            hint(ui, pal, &format!("{}: falta permissão para criar eventos.", src.label()));
+                            if ui.add_enabled(!waiting, Button::new("Reconectar")).clicked() {
+                                self.start_login(src, &ctx);
+                            }
+                        });
+                    }
+                }
+            });
 
             section(ui, pal, "Linha do tempo");
             card(ui, pal, |ui| {
@@ -357,16 +390,16 @@ impl Settings {
     }
 }
 
-fn pal_blue(pal: &Pal) -> Color32 {
+pub(super) fn pal_blue(pal: &Pal) -> Color32 {
     if pal.dark { Color32::from_rgb(10, 132, 255) } else { Color32::from_rgb(0, 122, 255) }
 }
 
-fn section(ui: &mut Ui, pal: &Pal, title: &str) {
+pub(super) fn section(ui: &mut Ui, pal: &Pal, title: &str) {
     ui.add_space(8.0);
     ui.label(RichText::new(title.to_uppercase()).font(font(11.5)).color(pal.secondary));
 }
 
-fn card(ui: &mut Ui, pal: &Pal, add: impl FnOnce(&mut Ui)) {
+pub(super) fn card(ui: &mut Ui, pal: &Pal, add: impl FnOnce(&mut Ui)) {
     egui::Frame::new()
         .fill(pal.card)
         .corner_radius(CornerRadius::same(14))
@@ -378,13 +411,13 @@ fn card(ui: &mut Ui, pal: &Pal, add: impl FnOnce(&mut Ui)) {
         });
 }
 
-fn row(ui: &mut Ui, pal: &Pal, label: &str, add: impl FnOnce(&mut Ui)) {
+pub(super) fn row(ui: &mut Ui, pal: &Pal, label: &str, add: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).font(font(13.5)).color(pal.primary));
         ui.with_layout(Layout::right_to_left(Align::Center), add);
     });
 }
 
-fn hint(ui: &mut Ui, pal: &Pal, text: &str) {
+pub(super) fn hint(ui: &mut Ui, pal: &Pal, text: &str) {
     ui.label(RichText::new(text).font(font(11.5)).color(fade(pal.secondary, 0.9)));
 }

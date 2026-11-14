@@ -71,15 +71,25 @@ pub struct Tokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: DateTime<Utc>,
+    /// Permissões concedidas. `None` em logins antigos (antes da escrita existir).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl Tokens {
-    pub fn from_response(r: &TokenResponse, previous_refresh: Option<String>) -> Tokens {
+    /// Monta os tokens a partir da resposta; o que faltar (refresh, escopo) vem dos anteriores.
+    pub fn from_response(r: &TokenResponse, previous: Option<&Tokens>) -> Tokens {
         Tokens {
             access_token: r.access_token.clone(),
-            refresh_token: r.refresh_token.clone().or(previous_refresh),
+            refresh_token: r.refresh_token.clone().or_else(|| previous.and_then(|p| p.refresh_token.clone())),
             expires_at: Utc::now() + Duration::seconds(r.expires_in.unwrap_or(3600) as i64),
+            scope: r.scope.clone().or_else(|| previous.and_then(|p| p.scope.clone())),
         }
+    }
+
+    /// O login concedeu esta permissão?
+    pub fn has_scope(&self, needle: &str) -> bool {
+        self.scope.as_deref().is_some_and(|s| s.contains(needle))
     }
 
     pub fn is_fresh(&self) -> bool {
@@ -106,4 +116,6 @@ pub struct TokenResponse {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_in: Option<u64>,
+    /// Permissões concedidas (separadas por espaço).
+    pub scope: Option<String>,
 }
