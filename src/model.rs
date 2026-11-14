@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -51,9 +51,25 @@ pub struct Event {
     /// Cor do calendário (RGB).
     pub color: [u8; 3],
     pub source: Source,
+    /// Página do evento no serviço (para editar no navegador).
+    #[serde(default)]
+    pub link: Option<String>,
 }
 
 impl Event {
+    /// Endereço para editar o evento no navegador: a página do próprio evento
+    /// quando o serviço informa, senão a agenda web da conta.
+    pub fn web_url(&self) -> &str {
+        match &self.link {
+            Some(l) if l.starts_with("https://") => l,
+            _ => match self.source {
+                Source::Outlook => "https://outlook.office.com/calendar/",
+                Source::Google => "https://calendar.google.com/calendar/",
+                Source::ICloud => "https://www.icloud.com/calendar/",
+            },
+        }
+    }
+
     /// Início em horário local (dia inteiro = meia-noite local).
     pub fn local_start(&self) -> DateTime<Local> {
         match &self.when {
@@ -115,6 +131,22 @@ pub struct CalendarInfo {
     pub color: [u8; 3],
     /// Dá para criar eventos nele.
     pub writable: bool,
+    /// Reunião online que o calendário sabe gerar (`hangoutsMeet`, `teamsForBusiness`…).
+    #[serde(default)]
+    pub meeting: Option<String>,
+}
+
+impl CalendarInfo {
+    /// Nome amigável da reunião online deste calendário.
+    pub fn meeting_label(&self) -> Option<&'static str> {
+        Some(match self.meeting.as_deref()? {
+            "hangoutsMeet" => "Google Meet",
+            "teamsForBusiness" => "Microsoft Teams",
+            "skypeForBusiness" => "Skype for Business",
+            "skypeForConsumer" => "Skype",
+            _ => "reunião online",
+        })
+    }
 }
 
 /// Evento a ser criado.
@@ -123,6 +155,149 @@ pub struct NewEvent {
     pub title: String,
     pub when: When,
     pub location: Option<String>,
+    pub description: Option<String>,
+    pub repeat: Option<Repeat>,
+    pub reminder: Reminder,
+    pub show_as: ShowAs,
+    pub private: bool,
+    /// E-mails dos convidados (Google e Outlook mandam o convite).
+    pub attendees: Vec<String>,
+    /// Gera o link de reunião online com este provedor (`hangoutsMeet`, `teamsForBusiness`…).
+    pub online_meeting: Option<String>,
+}
+
+impl NewEvent {
+    /// Data local de início (base da repetição).
+    pub fn local_start_date(&self) -> NaiveDate {
+        match &self.when {
+            When::Timed { start, .. } => start.with_timezone(&Local).date_naive(),
+            When::AllDay { start, .. } => *start,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freq {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepeatEnd {
+    Never,
+    /// Última data (inclusive), no horário local.
+    Until(NaiveDate),
+    Count(u32),
+}
+
+/// Regra de repetição (subconjunto comum a Google, Outlook e iCalendar).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Repeat {
+    pub freq: Freq,
+    /// A cada N dias/semanas/meses/anos.
+    pub interval: u32,
+    /// Dias da semana (só na repetição semanal; vazio = o dia do início).
+    pub weekdays: Vec<Weekday>,
+    pub end: RepeatEnd,
+}
+
+impl Repeat {
+    /// Regra RRULE (RFC 5545), sem o prefixo `RRULE:`.
+    /// `day_shift` desloca os dias da semana quando o DTSTART vai em UTC e cai
+    /// em outro dia que o horário local (ex.: 22h em Brasília = 1h UTC do dia seguinte).
+    pub fn rrule(&self, all_day: bool, day_shift: i64) -> String {
+        let freq = match self.freq {
+            Freq::Daily => "DAILY",
+            Freq::Weekly => "WEEKLY",
+            Freq::Monthly => "MONTHLY",
+            Freq::Yearly => "YEARLY",
+        };
+        let mut r = format!("FREQ={freq}");
+        if self.interval > 1 {
+            r.push_str(&format!(";INTERVAL={}", self.interval));
+        }
+        if self.freq == Freq::Weekly && !self.weekdays.is_empty() {
+            let days: Vec<&str> = self.weekdays.iter().map(|d| byday(shift_weekday(*d, day_shift))).collect();
+            r.push_str(&format!(";BYDAY={}", days.join(",")));
+        }
+        match self.end {
+            RepeatEnd::Never => {}
+            RepeatEnd::Count(n) => r.push_str(&format!(";COUNT={}", n.max(1))),
+            RepeatEnd::Until(d) if all_day => r.push_str(&format!(";UNTIL={}", d.format("%Y%m%d"))),
+            RepeatEnd::Until(d) => {
+                // fim do dia local, em UTC
+                let end = local_midnight(d.succ_opt().unwrap_or(d)).with_timezone(&Utc) - chrono::Duration::seconds(1);
+                r.push_str(&format!(";UNTIL={}", end.format("%Y%m%dT%H%M%SZ")));
+            }
+        }
+        r
+    }
+}
+
+fn shift_weekday(d: Weekday, by: i64) -> Weekday {
+    let n = (d.num_days_from_monday() as i64 + by).rem_euclid(7);
+    Weekday::try_from(n as u8).unwrap_or(d)
+}
+
+fn byday(d: Weekday) -> &'static str {
+    match d {
+        Weekday::Mon => "MO",
+        Weekday::Tue => "TU",
+        Weekday::Wed => "WE",
+        Weekday::Thu => "TH",
+        Weekday::Fri => "FR",
+        Weekday::Sat => "SA",
+        Weekday::Sun => "SU",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reminder {
+    /// O lembrete padrão do calendário.
+    Default,
+    Off,
+    /// Minutos antes do início.
+    Minutes(u32),
+}
+
+/// Como o horário aparece para quem vê sua disponibilidade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowAs {
+    Busy,
+    Free,
+    /// Só no Outlook.
+    Tentative,
+    /// Só no Outlook ("Ausente").
+    Away,
+    /// Só no Outlook.
+    WorkingElsewhere,
+}
+
+impl ShowAs {
+    pub fn label(self) -> &'static str {
+        match self {
+            ShowAs::Busy => "Ocupado",
+            ShowAs::Free => "Disponível",
+            ShowAs::Tentative => "Provisório",
+            ShowAs::Away => "Ausente",
+            ShowAs::WorkingElsewhere => "Trabalhando em outro lugar",
+        }
+    }
+
+    /// Opções que o serviço aceita.
+    pub fn options(src: Source) -> &'static [ShowAs] {
+        match src {
+            Source::Outlook => &[ShowAs::Busy, ShowAs::Free, ShowAs::Tentative, ShowAs::Away, ShowAs::WorkingElsewhere],
+            Source::Google | Source::ICloud => &[ShowAs::Busy, ShowAs::Free],
+        }
+    }
+}
+
+/// Fuso horário local no formato IANA (ex.: `America/Sao_Paulo`).
+pub fn local_tz_name() -> Option<String> {
+    iana_time_zone::get_timezone().ok().filter(|s| s.contains('/'))
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -174,3 +349,29 @@ pub fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
 
 /// Azul do sistema iOS — cor padrão quando o calendário não tem uma.
 pub const DEFAULT_COLOR: [u8; 3] = [0, 122, 255];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rep(freq: Freq, interval: u32, weekdays: Vec<Weekday>, end: RepeatEnd) -> Repeat {
+        Repeat { freq, interval, weekdays, end }
+    }
+
+    #[test]
+    fn rrule_basico() {
+        assert_eq!(rep(Freq::Daily, 1, vec![], RepeatEnd::Never).rrule(false, 0), "FREQ=DAILY");
+        assert_eq!(rep(Freq::Monthly, 2, vec![], RepeatEnd::Count(5)).rrule(false, 0), "FREQ=MONTHLY;INTERVAL=2;COUNT=5");
+        let d = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        assert_eq!(rep(Freq::Yearly, 1, vec![], RepeatEnd::Until(d)).rrule(true, 0), "FREQ=YEARLY;UNTIL=20261231");
+        assert!(rep(Freq::Daily, 1, vec![], RepeatEnd::Until(d)).rrule(false, 0).ends_with('Z'));
+    }
+
+    #[test]
+    fn rrule_semanal_com_deslocamento() {
+        let r = rep(Freq::Weekly, 1, vec![Weekday::Mon, Weekday::Sun], RepeatEnd::Never);
+        assert_eq!(r.rrule(false, 0), "FREQ=WEEKLY;BYDAY=MO,SU");
+        // 22h de domingo em Brasília = 1h de segunda em UTC
+        assert_eq!(r.rrule(false, 1), "FREQ=WEEKLY;BYDAY=TU,MO");
+    }
+}

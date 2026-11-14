@@ -9,7 +9,7 @@ use url::Url;
 use super::oauth::{self, Flow};
 use super::{check, client};
 use crate::config::GoogleCfg;
-use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Source, When, DEFAULT_COLOR};
+use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Reminder, ShowAs, Source, When, DEFAULT_COLOR};
 use crate::store::{TokenResponse, Tokens};
 
 /// Ler agendas e criar eventos.
@@ -95,6 +95,14 @@ struct CalEntry {
     selected: Option<bool>,
     hidden: Option<bool>,
     access_role: Option<String>,
+    conference_properties: Option<ConferenceProps>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConferenceProps {
+    #[serde(default)]
+    allowed_conference_solution_types: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +119,8 @@ struct GEvent {
     status: Option<String>,
     summary: Option<String>,
     location: Option<String>,
+    #[serde(rename = "htmlLink")]
+    html_link: Option<String>,
     start: Option<GTime>,
     end: Option<GTime>,
     #[serde(default)]
@@ -176,6 +186,11 @@ pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
             name: cal_name.clone(),
             color,
             writable: matches!(cal.access_role.as_deref(), Some("owner" | "writer")),
+            meeting: cal
+                .conference_properties
+                .as_ref()
+                .filter(|p| p.allowed_conference_solution_types.iter().any(|t| t == "hangoutsMeet"))
+                .map(|_| "hangoutsMeet".to_string()),
         });
         let mut url = Url::parse(API)?;
         url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["calendars", cal.id.as_str(), "events"]);
@@ -208,6 +223,7 @@ pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
                     calendar: cal_name.clone(),
                     color,
                     source: Source::Google,
+                    link: e.html_link,
                 });
             }
             page = list.next_page_token;
@@ -230,23 +246,77 @@ pub fn create(cfg: &GoogleCfg, calendar_id: &str, ev: &NewEvent) -> Result<()> {
         anyhow::bail!("Google: conecte a conta de novo em Ajustes para permitir criar eventos");
     }
     let token = access_token(cfg)?;
-    let (start, end) = match &ev.when {
-        When::Timed { start, end } => (
-            serde_json::json!({ "dateTime": start.to_rfc3339() }),
-            serde_json::json!({ "dateTime": end.to_rfc3339() }),
-        ),
-        When::AllDay { start, end } => (
-            serde_json::json!({ "date": start.to_string() }),
-            serde_json::json!({ "date": end.to_string() }),
-        ),
-    };
-    let mut body = serde_json::json!({ "summary": ev.title, "start": start, "end": end });
-    if let Some(l) = &ev.location {
-        body["location"] = serde_json::json!(l);
-    }
+    let body = event_body(ev);
     let mut url = Url::parse(API)?;
     url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["calendars", calendar_id, "events"]);
-    let resp = client().post(url).bearer_auth(&token).json(&body).send().context("Google: sem conexão com o servidor")?;
+    let mut query: Vec<(&str, &str)> = Vec::new();
+    if ev.online_meeting.is_some() {
+        query.push(("conferenceDataVersion", "1"));
+    }
+    if !ev.attendees.is_empty() {
+        query.push(("sendUpdates", "all"));
+    }
+    let resp = client()
+        .post(url)
+        .query(&query)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .context("Google: sem conexão com o servidor")?;
     check(resp, "Google (criar evento)")?;
     Ok(())
+}
+
+/// Corpo JSON de um evento novo (Calendar API v3, `events.insert`).
+fn event_body(ev: &NewEvent) -> serde_json::Value {
+    use serde_json::json;
+
+    // o fuso é obrigatório em eventos que se repetem (a repetição é expandida nele)
+    let tz = crate::model::local_tz_name().unwrap_or_else(|| "UTC".into());
+    let (start, end) = match &ev.when {
+        When::Timed { start, end } => (
+            json!({ "dateTime": start.with_timezone(&chrono::Local).to_rfc3339(), "timeZone": tz }),
+            json!({ "dateTime": end.with_timezone(&chrono::Local).to_rfc3339(), "timeZone": tz }),
+        ),
+        When::AllDay { start, end } => (
+            json!({ "date": start.to_string(), "timeZone": tz }),
+            json!({ "date": end.to_string(), "timeZone": tz }),
+        ),
+    };
+    let mut body = json!({ "summary": ev.title, "start": start, "end": end });
+    if let Some(l) = &ev.location {
+        body["location"] = json!(l);
+    }
+    if let Some(d) = &ev.description {
+        body["description"] = json!(d);
+    }
+    if let Some(r) = &ev.repeat {
+        body["recurrence"] = json!([format!("RRULE:{}", r.rrule(matches!(ev.when, When::AllDay { .. }), 0))]);
+    }
+    match ev.reminder {
+        Reminder::Default => {}
+        Reminder::Off => body["reminders"] = json!({ "useDefault": false, "overrides": [] }),
+        Reminder::Minutes(m) => {
+            body["reminders"] = json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": m }] })
+        }
+    }
+    if ev.show_as == ShowAs::Free {
+        body["transparency"] = json!("transparent");
+    }
+    if ev.private {
+        body["visibility"] = json!("private");
+    }
+    if !ev.attendees.is_empty() {
+        body["attendees"] = ev.attendees.iter().map(|e| json!({ "email": e })).collect();
+    }
+    if let Some(provider) = &ev.online_meeting {
+        use rand::distr::{Alphanumeric, SampleString};
+        body["conferenceData"] = json!({
+            "createRequest": {
+                "requestId": Alphanumeric.sample_string(&mut rand::rng(), 24),
+                "conferenceSolutionKey": { "type": provider },
+            }
+        });
+    }
+    body
 }

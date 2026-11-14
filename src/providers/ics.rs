@@ -545,6 +545,7 @@ fn to_event(ev: &VEvent, start: &Dt, span: Duration, cal: &str, color: [u8; 3], 
         calendar: cal.to_string(),
         color,
         source,
+        link: None,
     }
 }
 

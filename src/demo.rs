@@ -24,6 +24,7 @@ pub fn cache() -> Cache {
             calendar: cal.into(),
             color,
             source,
+            link: None,
         }
     };
     let timed = |a: i64, b: i64| When::Timed { start: at(a).with_timezone(&Utc), end: at(b).with_timezone(&Utc) };

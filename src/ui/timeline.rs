@@ -215,7 +215,7 @@ fn event_row(ui: &mut Ui, v: &View, row: usize, c: &Cols, e: &Event, last: bool)
     let progress_h = if ongoing { 8.0 } else { 0.0 };
     let card_h = (pad_y + title.size().y + 3.0 + sub.size().y + pad_y + progress_h).max(58.0);
 
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), card_h + ROW_GAP), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), card_h + ROW_GAP), Sense::click());
     let (mut a, dy) = v.row_anim(row, Some(&e.id));
     if past {
         a *= 0.48;
@@ -286,6 +286,18 @@ fn event_row(ui: &mut Ui, v: &View, row: usize, c: &Cols, e: &Event, last: bool)
         fill_r.set_width(track.width() * done * grow);
         p.rect_filled(fill_r, CornerRadius::same(2), fade(col, a));
     }
+
+    // clicar no cartão (ou "Editar no navegador" no menu) abre o evento no serviço
+    if resp.clicked() {
+        let _ = webbrowser::open(e.web_url());
+    }
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    resp.context_menu(|ui| {
+        if ui.button("Editar no navegador").clicked() {
+            let _ = webbrowser::open(e.web_url());
+            ui.close();
+        }
+    });
 
     if resp.hovered() {
         let mut tip = format!("{}\n{} – {}", e.title, fmt::hm(start), fmt::hm(end));

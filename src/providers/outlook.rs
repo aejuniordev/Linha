@@ -8,7 +8,7 @@ use serde::Deserialize;
 use super::oauth::{self, Flow};
 use super::{check, client};
 use crate::config::OutlookCfg;
-use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Source, When, DEFAULT_COLOR};
+use crate::model::{parse_hex_color, CalendarInfo, Event, Freq, NewEvent, Reminder, RepeatEnd, ShowAs, Source, When, DEFAULT_COLOR};
 use crate::store::{TokenResponse, Tokens};
 
 /// Ler e criar eventos.
@@ -92,6 +92,9 @@ struct Calendar {
     hex_color: Option<String>,
     color: Option<String>,
     can_edit: Option<bool>,
+    #[serde(default)]
+    allowed_online_meeting_providers: Vec<String>,
+    default_online_meeting_provider: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +110,7 @@ struct GEvent {
     is_cancelled: bool,
     location: Option<GLocation>,
     response_status: Option<GResponse>,
+    web_link: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -165,7 +169,7 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
         )
     };
 
-    let cals: Page<Calendar> = get(&format!("{GRAPH}/me/calendars?$select=id,name,hexColor,color,canEdit&$top=100"))?.json()?;
+    let cals: Page<Calendar> = get(&format!("{GRAPH}/me/calendars?$select=id,name,hexColor,color,canEdit,allowedOnlineMeetingProviders,defaultOnlineMeetingProvider&$top=100"))?.json()?;
     let fmt = "%Y-%m-%dT%H:%M:%SZ";
     let mut out = Vec::new();
     let mut infos = Vec::new();
@@ -183,10 +187,16 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
             name: cal_name.clone(),
             color,
             writable: cal.can_edit.unwrap_or(true),
+            meeting: cal
+                .default_online_meeting_provider
+                .iter()
+                .chain(&cal.allowed_online_meeting_providers)
+                .find(|p| !p.is_empty() && p.as_str() != "unknown")
+                .cloned(),
         });
         let mut url = Some(format!(
             "{GRAPH}/me/calendars/{}/calendarView?startDateTime={}&endDateTime={}&$top=200\
-             &$select=id,subject,start,end,isAllDay,isCancelled,location,responseStatus",
+             &$select=id,subject,start,end,isAllDay,isCancelled,location,responseStatus,webLink",
             cal.id,
             from.format(fmt),
             to.format(fmt)
@@ -214,6 +224,7 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
                     calendar: cal_name.clone(),
                     color,
                     source: Source::Outlook,
+                    link: e.web_link,
                 });
             }
             url = page.next;
@@ -241,23 +252,126 @@ pub fn create(cfg: &OutlookCfg, calendar_id: &str, ev: &NewEvent) -> Result<()> 
         anyhow::bail!("Outlook: conecte a conta de novo em Ajustes para permitir criar eventos");
     }
     let token = access_token(cfg)?;
-    let fmt = "%Y-%m-%dT%H:%M:%S";
-    let (start, end, all_day) = match &ev.when {
-        When::Timed { start, end } => (start.format(fmt).to_string(), end.format(fmt).to_string(), false),
-        When::AllDay { start, end } => (format!("{start}T00:00:00"), format!("{end}T00:00:00"), true),
-    };
-    let mut body = serde_json::json!({
-        "subject": ev.title,
-        "isAllDay": all_day,
-        "start": { "dateTime": start, "timeZone": "UTC" },
-        "end": { "dateTime": end, "timeZone": "UTC" },
-    });
-    if let Some(l) = &ev.location {
-        body["location"] = serde_json::json!({ "displayName": l });
-    }
+    let body = event_body(ev);
     let mut url = url::Url::parse(GRAPH)?;
     url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["me", "calendars", calendar_id, "events"]);
     let resp = client().post(url).bearer_auth(&token).json(&body).send().context("Outlook: sem conexão com o servidor")?;
     check(resp, "Outlook (criar evento)")?;
     Ok(())
+}
+
+/// Corpo JSON de um evento novo (Microsoft Graph, `POST /events`).
+fn event_body(ev: &NewEvent) -> serde_json::Value {
+    use chrono::{Datelike, Local, Weekday};
+    use serde_json::json;
+
+    let fmt = "%Y-%m-%dT%H:%M:%S";
+    let all_day = matches!(ev.when, When::AllDay { .. });
+    // Eventos que se repetem vão no horário local + fuso, para não "andarem" no
+    // horário de verão; os demais seguem em UTC.
+    let tz = ev.repeat.as_ref().and(crate::model::local_tz_name()).filter(|_| !all_day);
+    let (start, end, zone) = match (&ev.when, &tz) {
+        (When::Timed { start, end }, Some(tz)) => (
+            start.with_timezone(&Local).format(fmt).to_string(),
+            end.with_timezone(&Local).format(fmt).to_string(),
+            tz.clone(),
+        ),
+        (When::Timed { start, end }, None) => (start.format(fmt).to_string(), end.format(fmt).to_string(), "UTC".into()),
+        (When::AllDay { start, end }, _) => (format!("{start}T00:00:00"), format!("{end}T00:00:00"), "UTC".into()),
+    };
+    let mut body = json!({
+        "subject": ev.title,
+        "isAllDay": all_day,
+        "start": { "dateTime": start, "timeZone": zone },
+        "end": { "dateTime": end, "timeZone": zone },
+    });
+    if let Some(l) = &ev.location {
+        body["location"] = json!({ "displayName": l });
+    }
+    if let Some(d) = &ev.description {
+        body["body"] = json!({ "contentType": "text", "content": d });
+    }
+    if let Some(r) = &ev.repeat {
+        let first = ev.local_start_date();
+        // dias da semana no mesmo referencial do início enviado (local ou UTC)
+        let shift = match (&ev.when, &tz) {
+            (When::Timed { start, .. }, None) => (start.date_naive() - first).num_days(),
+            _ => 0,
+        };
+        let day_name = |d: Weekday| {
+            let d = Weekday::try_from(((d.num_days_from_monday() as i64 + shift).rem_euclid(7)) as u8).unwrap_or(d);
+            match d {
+                Weekday::Mon => "monday",
+                Weekday::Tue => "tuesday",
+                Weekday::Wed => "wednesday",
+                Weekday::Thu => "thursday",
+                Weekday::Fri => "friday",
+                Weekday::Sat => "saturday",
+                Weekday::Sun => "sunday",
+            }
+        };
+        let anchor = first + chrono::Duration::days(shift);
+        let mut pattern = json!({ "interval": r.interval.max(1) });
+        match r.freq {
+            Freq::Daily => pattern["type"] = json!("daily"),
+            Freq::Weekly => {
+                let days: Vec<Weekday> = if r.weekdays.is_empty() { vec![first.weekday()] } else { r.weekdays.clone() };
+                pattern["type"] = json!("weekly");
+                pattern["daysOfWeek"] = days.into_iter().map(day_name).collect();
+                pattern["firstDayOfWeek"] = json!("sunday");
+            }
+            Freq::Monthly => {
+                pattern["type"] = json!("absoluteMonthly");
+                pattern["dayOfMonth"] = json!(anchor.day());
+            }
+            Freq::Yearly => {
+                pattern["type"] = json!("absoluteYearly");
+                pattern["dayOfMonth"] = json!(anchor.day());
+                pattern["month"] = json!(anchor.month());
+            }
+        }
+        let mut range = json!({ "startDate": anchor.to_string(), "recurrenceTimeZone": zone });
+        match r.end {
+            RepeatEnd::Never => range["type"] = json!("noEnd"),
+            RepeatEnd::Until(d) => {
+                range["type"] = json!("endDate");
+                range["endDate"] = json!((d + chrono::Duration::days(shift)).to_string());
+            }
+            RepeatEnd::Count(n) => {
+                range["type"] = json!("numbered");
+                range["numberOfOccurrences"] = json!(n.max(1));
+            }
+        }
+        body["recurrence"] = json!({ "pattern": pattern, "range": range });
+    }
+    match ev.reminder {
+        Reminder::Default => {}
+        Reminder::Off => body["isReminderOn"] = json!(false),
+        Reminder::Minutes(m) => {
+            body["isReminderOn"] = json!(true);
+            body["reminderMinutesBeforeStart"] = json!(m);
+        }
+    }
+    body["showAs"] = json!(match ev.show_as {
+        ShowAs::Busy => "busy",
+        ShowAs::Free => "free",
+        ShowAs::Tentative => "tentative",
+        ShowAs::Away => "oof",
+        ShowAs::WorkingElsewhere => "workingElsewhere",
+    });
+    if ev.private {
+        body["sensitivity"] = json!("private");
+    }
+    if !ev.attendees.is_empty() {
+        body["attendees"] = ev
+            .attendees
+            .iter()
+            .map(|e| json!({ "emailAddress": { "address": e }, "type": "required" }))
+            .collect();
+    }
+    if let Some(provider) = &ev.online_meeting {
+        body["isOnlineMeeting"] = json!(true);
+        body["onlineMeetingProvider"] = json!(provider);
+    }
+    body
 }

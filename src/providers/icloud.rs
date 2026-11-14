@@ -8,7 +8,7 @@ use url::Url;
 
 use super::{check, client, ics};
 use crate::config::ICloudCfg;
-use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Source, When, DEFAULT_COLOR};
+use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Reminder, ShowAs, Source, When, DEFAULT_COLOR};
 
 const ROOT: &str = "https://caldav.icloud.com/";
 const NS_DAV: &str = "DAV:";
@@ -141,7 +141,7 @@ pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
     let cals = discover(&dav)?;
     let infos = cals
         .iter()
-        .map(|c| CalendarInfo { source: Source::ICloud, id: c.url.to_string(), name: c.name.clone(), color: c.color, writable: true })
+        .map(|c| CalendarInfo { source: Source::ICloud, id: c.url.to_string(), name: c.name.clone(), color: c.color, writable: true, meeting: None })
         .collect();
     for cal in cals {
         let xml = dav.request("REPORT", &cal.url, "1", query.clone())?;
@@ -201,6 +201,32 @@ pub fn create(cfg: &ICloudCfg, calendar_url: &str, ev: &NewEvent) -> Result<()> 
     ];
     if let Some(l) = &ev.location {
         lines.push(format!("LOCATION:{}", ics_text(l)));
+    }
+    if let Some(d) = &ev.description {
+        lines.push(format!("DESCRIPTION:{}", ics_text(d)));
+    }
+    if let Some(r) = &ev.repeat {
+        // DTSTART vai em UTC: os dias da semana seguem o dia UTC do início
+        let shift = match &ev.when {
+            When::Timed { start, .. } => (start.date_naive() - ev.local_start_date()).num_days(),
+            When::AllDay { .. } => 0,
+        };
+        lines.push(format!("RRULE:{}", r.rrule(matches!(ev.when, When::AllDay { .. }), shift)));
+    }
+    if ev.show_as == ShowAs::Free {
+        lines.push("TRANSP:TRANSPARENT".into());
+    }
+    if ev.private {
+        lines.push("CLASS:PRIVATE".into());
+    }
+    if let Reminder::Minutes(m) = ev.reminder {
+        lines.extend([
+            "BEGIN:VALARM".into(),
+            "ACTION:DISPLAY".into(),
+            format!("DESCRIPTION:{}", ics_text(&ev.title)),
+            format!("TRIGGER:-PT{m}M"),
+            "END:VALARM".into(),
+        ]);
     }
     lines.extend(["END:VEVENT".into(), "END:VCALENDAR".into()]);
     let body: String = lines.iter().map(|l| fold(l) + "\r\n").collect();

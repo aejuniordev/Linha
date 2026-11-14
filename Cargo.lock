@@ -2442,6 +2442,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui_extras",
+ "iana-time-zone",
  "jiff",
  "rand 0.9.5",
  "reqwest",
