@@ -453,6 +453,19 @@ pub struct VEvent {
     exdates: Vec<Dt>,
     pub recurrence_id: Option<Dt>,
     pub cancelled: bool,
+    /// TRANSP:TRANSPARENT = disponível.
+    pub transparent: bool,
+    /// Bloqueio criado pelo Linha (`X-LINHA-BLOQUEIO`).
+    pub block: bool,
+}
+
+/// Calendário de onde vêm os VEVENTs.
+pub struct Target<'a> {
+    pub account: &'a str,
+    pub calendar_id: &'a str,
+    pub name: &'a str,
+    pub color: [u8; 3],
+    pub source: Source,
 }
 
 impl VEvent {
@@ -515,6 +528,8 @@ fn build(props: Vec<Prop>) -> Option<VEvent> {
         exdates: props.iter().filter(|p| p.name == "EXDATE").flat_map(Dt::parse_prop).collect(),
         recurrence_id: get("RECURRENCE-ID").and_then(|p| Dt::parse_prop(p).into_iter().next()),
         cancelled: get("STATUS").map(|p| p.value.eq_ignore_ascii_case("CANCELLED")).unwrap_or(false),
+        transparent: get("TRANSP").is_some_and(|p| p.value.trim().eq_ignore_ascii_case("TRANSPARENT")),
+        block: get(super::icloud::BLOCK_PROP).is_some(),
         start,
     })
 }
@@ -528,7 +543,7 @@ fn overlaps(start: DateTime<Utc>, span: Duration, from: DateTime<Utc>, to: DateT
     }
 }
 
-fn to_event(ev: &VEvent, start: &Dt, span: Duration, cal: &str, color: [u8; 3], source: Source) -> Event {
+fn to_event(ev: &VEvent, start: &Dt, span: Duration, t: &Target) -> Event {
     let when = match start {
         Dt::Date(d) => When::AllDay { start: *d, end: *d + span.max(Duration::days(1)) },
         other => {
@@ -538,26 +553,24 @@ fn to_event(ev: &VEvent, start: &Dt, span: Duration, cal: &str, color: [u8; 3], 
     };
     let s = start.to_utc().timestamp();
     Event {
-        id: format!("{}:{}:{}", source.key(), ev.uid, s),
+        id: format!("{}:{}:{}", t.account, ev.uid, s),
         title: if ev.summary.trim().is_empty() { "(sem título)".into() } else { ev.summary.clone() },
         when,
         location: ev.location.clone(),
-        calendar: cal.to_string(),
-        color,
-        source,
+        calendar: t.name.to_string(),
+        color: t.color,
+        source: t.source,
         link: None,
+        account: t.account.to_string(),
+        calendar_id: t.calendar_id.to_string(),
+        uid: ev.uid.clone(),
+        free: ev.transparent,
+        block: ev.block,
     }
 }
 
 /// Transforma VEVENTs (possivelmente recorrentes) em ocorrências dentro de [from, to).
-pub fn expand(
-    vevents: &[VEvent],
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-    cal: &str,
-    color: [u8; 3],
-    source: Source,
-) -> Vec<Event> {
+pub fn expand(vevents: &[VEvent], from: DateTime<Utc>, to: DateTime<Utc>, target: &Target) -> Vec<Event> {
     // exceções (RECURRENCE-ID) substituem a ocorrência original
     let mut overridden: HashMap<&str, HashSet<i64>> = HashMap::new();
     for ev in vevents {
@@ -576,7 +589,7 @@ pub fn expand(
             (Some(r), None) => r,
             _ => {
                 if overlaps(ev.start.to_utc(), span, from, to) {
-                    out.push(to_event(ev, &ev.start, span, cal, color, source));
+                    out.push(to_event(ev, &ev.start, span, target));
                 }
                 continue;
             }
@@ -622,7 +635,7 @@ pub fn expand(
                     break 'periods;
                 }
                 if !skip.contains(&occ_utc.timestamp()) && overlaps(occ_utc, span, from, to) {
-                    out.push(to_event(ev, &occ, span, cal, color, source));
+                    out.push(to_event(ev, &occ, span, target));
                 }
             }
         }
@@ -636,6 +649,20 @@ mod tests {
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn target(name: &str) -> Target<'_> {
+        Target { account: "icloud", calendar_id: "cal", name, color: [0, 0, 0], source: Source::ICloud }
+    }
+
+    #[test]
+    fn transparencia_e_bloqueio() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x@linha\r\nSUMMARY:Ocupado\r\nDTSTART:20261110T120000Z\r\n\
+                   DTEND:20261110T130000Z\r\nTRANSP:TRANSPARENT\r\nX-LINHA-BLOQUEIO:1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let evs = expand(&parse_vevents(ics), utc("2026-11-10T00:00:00Z"), utc("2026-11-11T00:00:00Z"), &target("c"));
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0].free && evs[0].block);
+        assert_eq!((evs[0].uid.as_str(), evs[0].account.as_str(), evs[0].calendar_id.as_str()), ("x@linha", "icloud", "cal"));
     }
 
     const WEEKLY: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\r\nSUMMARY:Daily de\r\n  produto\r\n\
@@ -652,7 +679,7 @@ SUMMARY:Daily (remarcada)\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].summary, "Daily de produto");
         assert_eq!(v[0].location.as_deref(), Some("Sala 3, 2º andar"));
-        let evs = expand(&v, utc("2026-11-09T00:00:00Z"), utc("2026-11-16T00:00:00Z"), "Trabalho", [0, 0, 0], Source::ICloud);
+        let evs = expand(&v, utc("2026-11-09T00:00:00Z"), utc("2026-11-16T00:00:00Z"), &target("Trabalho"));
         let mut starts: Vec<String> = evs
             .iter()
             .map(|e| match &e.when {
@@ -669,7 +696,7 @@ SUMMARY:Daily (remarcada)\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     fn monthly_last_friday_and_count() {
         let ics = "BEGIN:VEVENT\nUID:m\nSUMMARY:Retro\nDTSTART:20260130T170000Z\nDURATION:PT1H\nRRULE:FREQ=MONTHLY;BYDAY=-1FR;COUNT=12\nEND:VEVENT\n";
         let v = parse_vevents(ics);
-        let evs = expand(&v, utc("2026-11-01T00:00:00Z"), utc("2027-03-01T00:00:00Z"), "c", [0, 0, 0], Source::ICloud);
+        let evs = expand(&v, utc("2026-11-01T00:00:00Z"), utc("2027-03-01T00:00:00Z"), &target("c"));
         let days: Vec<String> = evs.iter().map(|e| e.local_start().with_timezone(&Utc).format("%Y-%m-%d").to_string()).collect();
         // jan..dez/2026 = 12 ocorrências; nov e dez dentro da janela
         assert_eq!(days, vec!["2026-11-27", "2026-12-25"]);
@@ -679,7 +706,7 @@ SUMMARY:Daily (remarcada)\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     fn all_day_yearly_birthday() {
         let ics = "BEGIN:VEVENT\nUID:b\nSUMMARY:Aniversário da Ana\nDTSTART;VALUE=DATE:19900314\nDTEND;VALUE=DATE:19900315\nRRULE:FREQ=YEARLY\nEND:VEVENT\n";
         let v = parse_vevents(ics);
-        let evs = expand(&v, utc("2027-03-01T00:00:00Z"), utc("2027-04-01T00:00:00Z"), "c", [0, 0, 0], Source::ICloud);
+        let evs = expand(&v, utc("2027-03-01T00:00:00Z"), utc("2027-04-01T00:00:00Z"), &target("c"));
         assert_eq!(evs.len(), 1);
         assert_eq!(
             evs[0].when,
@@ -690,7 +717,7 @@ SUMMARY:Daily (remarcada)\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn daily_until_and_interval() {
         let ics = "BEGIN:VEVENT\nUID:d\nSUMMARY:Remédio\nDTSTART:20261110T110000Z\nDTEND:20261110T111500Z\nRRULE:FREQ=DAILY;INTERVAL=2;UNTIL=20261116T110000Z\nEND:VEVENT\n";
-        let evs = expand(&parse_vevents(ics), utc("2026-11-01T00:00:00Z"), utc("2026-12-01T00:00:00Z"), "c", [0, 0, 0], Source::ICloud);
+        let evs = expand(&parse_vevents(ics), utc("2026-11-01T00:00:00Z"), utc("2026-12-01T00:00:00Z"), &target("c"));
         assert_eq!(evs.len(), 4); // 10, 12, 14, 16
     }
 

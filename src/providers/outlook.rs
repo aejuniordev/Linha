@@ -6,7 +6,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde::Deserialize;
 
 use super::oauth::{self, Flow};
-use super::{check, client};
+use super::{check, client, Fetched};
 use crate::config::OutlookCfg;
 use crate::model::{parse_hex_color, CalendarInfo, Event, Freq, NewEvent, Reminder, RepeatEnd, ShowAs, Source, When, DEFAULT_COLOR};
 use crate::store::{TokenResponse, Tokens};
@@ -26,8 +26,9 @@ fn client_id(cfg: &OutlookCfg) -> Result<String> {
     cfg.client_id().ok_or_else(|| anyhow!("Outlook: esta versão do Linha foi compilada sem o app da Microsoft (veja docs/OAUTH.md)"))
 }
 
-/// Abre o navegador para a pessoa entrar na conta Microsoft e guarda os tokens.
-pub fn login(cfg: &OutlookCfg, flow: &Flow) -> Result<()> {
+/// Abre o navegador para a pessoa entrar numa conta Microsoft. Devolve os tokens
+/// (ainda não gravados) e o e-mail da conta.
+pub fn login(cfg: &OutlookCfg, flow: &Flow) -> Result<(Tokens, String)> {
     let id = client_id(cfg)?;
     // A Microsoft aceita qualquer porta em http://localhost para apps de desktop.
     let grant = oauth::authorize(
@@ -52,12 +53,29 @@ pub fn login(cfg: &OutlookCfg, flow: &Flow) -> Result<()> {
     let tr: TokenResponse = check(resp, "Outlook (trocar código)")?.json()?;
     let mut t = Tokens::from_response(&tr, None);
     t.scope.get_or_insert_with(|| SCOPE.into());
-    t.save(Source::Outlook)
+    let who = whoami(&t.access_token).unwrap_or_default();
+    Ok((t, who))
 }
 
-fn access_token(cfg: &OutlookCfg) -> Result<String> {
+/// E-mail da conta: o dono do calendário padrão (não precisa de permissão extra).
+fn whoami(token: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Cal {
+        owner: Option<Owner>,
+    }
+    let resp = client().get(format!("{GRAPH}/me/calendar?$select=owner")).bearer_auth(token).send()?;
+    let cal: Cal = check(resp, "Outlook (conta)")?.json()?;
+    Ok(cal.owner.and_then(|o| o.address).unwrap_or_default())
+}
+
+#[derive(Deserialize)]
+struct Owner {
+    address: Option<String>,
+}
+
+fn access_token(cfg: &OutlookCfg, account: &str) -> Result<String> {
     let id = client_id(cfg)?;
-    let tokens = Tokens::load(Source::Outlook).ok_or_else(|| anyhow!("Outlook: conecte a conta em Ajustes"))?;
+    let tokens = Tokens::load(account).ok_or_else(|| anyhow!("Outlook: conecte a conta em Ajustes"))?;
     if tokens.is_fresh() {
         return Ok(tokens.access_token);
     }
@@ -73,7 +91,7 @@ fn access_token(cfg: &OutlookCfg) -> Result<String> {
         .send().context("Outlook: sem conexão com o servidor")?;
     let tr: TokenResponse = check(resp, "Outlook (renovar sessão)")?.json()?;
     let t = Tokens::from_response(&tr, Some(&tokens));
-    t.save(Source::Outlook)?;
+    t.save(account)?;
     Ok(t.access_token)
 }
 
@@ -95,6 +113,9 @@ struct Calendar {
     #[serde(default)]
     allowed_online_meeting_providers: Vec<String>,
     default_online_meeting_provider: Option<String>,
+    #[serde(default)]
+    is_default_calendar: bool,
+    owner: Option<Owner>,
 }
 
 #[derive(Deserialize)]
@@ -111,7 +132,15 @@ struct GEvent {
     location: Option<GLocation>,
     response_status: Option<GResponse>,
     web_link: Option<String>,
+    /// "free", "busy", "tentative", "oof"…
+    show_as: Option<String>,
+    /// Só vem preenchida nos bloqueios do Linha (pedida com `$expand`).
+    #[serde(default)]
+    single_value_extended_properties: Vec<serde_json::Value>,
 }
+
+/// Propriedade estendida que marca os bloqueios criados pelo Linha.
+const BLOCK_PROP: &str = "String {7c4e8a1d-2b3f-4e5a-9c6d-8f1a2b3c4d5e} Name LinhaBloqueio";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,8 +185,8 @@ fn date_part(s: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(s.get(..10).unwrap_or(s), "%Y-%m-%d").with_context(|| format!("data inválida: {s}"))
 }
 
-pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(Vec<Event>, Vec<CalendarInfo>)> {
-    let token = access_token(cfg)?;
+pub fn fetch(cfg: &OutlookCfg, account: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Fetched> {
+    let token = access_token(cfg, account)?;
     let http = client();
     let get = |url: &str| -> Result<reqwest::blocking::Response> {
         check(
@@ -169,10 +198,27 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
         )
     };
 
-    let cals: Page<Calendar> = get(&format!("{GRAPH}/me/calendars?$select=id,name,hexColor,color,canEdit,allowedOnlineMeetingProviders,defaultOnlineMeetingProvider&$top=100"))?.json()?;
+    let cals: Page<Calendar> = get(&format!(
+        "{GRAPH}/me/calendars?$select=id,name,hexColor,color,canEdit,allowedOnlineMeetingProviders,\
+         defaultOnlineMeetingProvider,isDefaultCalendar,owner&$top=100"
+    ))?
+    .json()?;
     let fmt = "%Y-%m-%dT%H:%M:%SZ";
     let mut out = Vec::new();
     let mut infos = Vec::new();
+    let who = cals
+        .value
+        .iter()
+        .find(|c| c.is_default_calendar)
+        .and_then(|c| c.owner.as_ref())
+        .and_then(|o| o.address.clone());
+    // traz a marca de bloqueio junto (só vem nos eventos que a têm)
+    // (o form-encoding troca espaço por "+"; no OData o certo é %20 — "+" de verdade já vira %2B)
+    let expand: String = url::form_urlencoded::byte_serialize(
+        format!("singleValueExtendedProperties($filter=id eq '{BLOCK_PROP}')").as_bytes(),
+    )
+    .collect::<String>()
+    .replace('+', "%20");
 
     for cal in cals.value {
         let color = cal
@@ -183,6 +229,8 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
         let cal_name = cal.name.unwrap_or_else(|| "Outlook".into());
         infos.push(CalendarInfo {
             source: Source::Outlook,
+            account: account.to_string(),
+            primary: cal.is_default_calendar,
             id: cal.id.clone(),
             name: cal_name.clone(),
             color,
@@ -196,7 +244,8 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
         });
         let mut url = Some(format!(
             "{GRAPH}/me/calendars/{}/calendarView?startDateTime={}&endDateTime={}&$top=200\
-             &$select=id,subject,start,end,isAllDay,isCancelled,location,responseStatus,webLink",
+             &$select=id,subject,start,end,isAllDay,isCancelled,location,responseStatus,webLink,showAs\
+             &$expand={expand}",
             cal.id,
             from.format(fmt),
             to.format(fmt)
@@ -216,8 +265,11 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
                         end: parse_graph_time(&e.end.date_time)?.and_utc(),
                     }
                 };
+                let block = e.single_value_extended_properties.iter().any(|p| {
+                    p.get("id").and_then(|v| v.as_str()).is_some_and(|id| id.eq_ignore_ascii_case(BLOCK_PROP))
+                });
                 out.push(Event {
-                    id: format!("outlook:{}", e.id),
+                    id: format!("{account}:{}", e.id),
                     title: e.subject.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "(sem título)".into()),
                     when,
                     location: e.location.and_then(|l| l.display_name).filter(|s| !s.trim().is_empty()),
@@ -225,12 +277,17 @@ pub fn fetch(cfg: &OutlookCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result
                     color,
                     source: Source::Outlook,
                     link: e.web_link,
+                    account: account.to_string(),
+                    calendar_id: cal.id.clone(),
+                    uid: e.id,
+                    free: e.show_as.as_deref() == Some("free"),
+                    block,
                 });
             }
             url = page.next;
         }
     }
-    Ok((out, infos))
+    Ok(Fetched { events: out, calendars: infos, who })
 }
 
 fn refresh_scope(tokens: &Tokens) -> &'static str {
@@ -241,22 +298,38 @@ fn refresh_scope(tokens: &Tokens) -> &'static str {
     }
 }
 
-/// O login atual permite criar eventos?
-pub fn can_write() -> bool {
-    Tokens::load(Source::Outlook).is_some_and(|t| t.has_scope("Calendars.ReadWrite"))
+/// O login desta conta permite criar eventos?
+pub fn can_write(account: &str) -> bool {
+    Tokens::load(account).is_some_and(|t| t.has_scope("Calendars.ReadWrite"))
 }
 
-/// Cria um evento no calendário `calendar_id`.
-pub fn create(cfg: &OutlookCfg, calendar_id: &str, ev: &NewEvent) -> Result<()> {
-    if !can_write() {
+/// Cria um evento no calendário `calendar_id` e devolve o id dele.
+pub fn create(cfg: &OutlookCfg, account: &str, calendar_id: &str, ev: &NewEvent) -> Result<String> {
+    if !can_write(account) {
         anyhow::bail!("Outlook: conecte a conta de novo em Ajustes para permitir criar eventos");
     }
-    let token = access_token(cfg)?;
+    let token = access_token(cfg, account)?;
     let body = event_body(ev);
     let mut url = url::Url::parse(GRAPH)?;
     url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["me", "calendars", calendar_id, "events"]);
     let resp = client().post(url).bearer_auth(&token).json(&body).send().context("Outlook: sem conexão com o servidor")?;
-    check(resp, "Outlook (criar evento)")?;
+    #[derive(Deserialize)]
+    struct Created {
+        id: String,
+    }
+    Ok(check(resp, "Outlook (criar evento)")?.json::<Created>().context("Outlook: resposta ao criar evento")?.id)
+}
+
+/// Apaga um evento. Já apagado (404) conta como sucesso.
+pub fn delete(cfg: &OutlookCfg, account: &str, event_id: &str) -> Result<()> {
+    let token = access_token(cfg, account)?;
+    let mut url = url::Url::parse(GRAPH)?;
+    url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["me", "events", event_id]);
+    let resp = client().delete(url).bearer_auth(&token).send().context("Outlook: sem conexão com o servidor")?;
+    if resp.status().as_u16() == 404 {
+        return Ok(());
+    }
+    check(resp, "Outlook (apagar evento)")?;
     Ok(())
 }
 
@@ -372,6 +445,9 @@ fn event_body(ev: &NewEvent) -> serde_json::Value {
     if let Some(provider) = &ev.online_meeting {
         body["isOnlineMeeting"] = json!(true);
         body["onlineMeetingProvider"] = json!(provider);
+    }
+    if ev.block {
+        body["singleValueExtendedProperties"] = json!([{ "id": BLOCK_PROP, "value": "1" }]);
     }
     body
 }

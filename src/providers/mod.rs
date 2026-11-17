@@ -12,7 +12,7 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use reqwest::blocking::{Client, Response};
 
-use crate::config::Config;
+use crate::config::{Account, Config};
 use crate::model::{CalendarInfo, Event, NewEvent, Source};
 
 pub fn client() -> Client {
@@ -23,39 +23,56 @@ pub fn client() -> Client {
         .expect("cliente HTTP")
 }
 
-/// Busca eventos (e a lista de calendários) de uma origem no intervalo [from, to).
-pub fn fetch(cfg: &Config, src: Source, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(Vec<Event>, Vec<CalendarInfo>)> {
-    match src {
-        Source::Outlook => outlook::fetch(&cfg.outlook, from, to),
-        Source::Google => google::fetch(&cfg.google, from, to),
-        Source::ICloud => icloud::fetch(&cfg.icloud, from, to),
+/// O que uma conta devolve ao sincronizar.
+pub struct Fetched {
+    pub events: Vec<Event>,
+    pub calendars: Vec<CalendarInfo>,
+    /// E-mail/dono da conta, quando o serviço informa.
+    pub who: Option<String>,
+}
+
+/// Busca eventos (e a lista de calendários) de uma conta no intervalo [from, to).
+pub fn fetch(cfg: &Config, acct: &Account, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Fetched> {
+    match acct.servico {
+        Source::Outlook => outlook::fetch(&cfg.outlook, &acct.id, from, to),
+        Source::Google => google::fetch(&cfg.google, &acct.id, from, to),
+        Source::ICloud => icloud::fetch(&acct.icloud(), &acct.id, from, to),
     }
 }
 
-/// Cria um evento num calendário.
-pub fn create(cfg: &Config, src: Source, calendar_id: &str, ev: &NewEvent) -> Result<()> {
-    match src {
-        Source::Outlook => outlook::create(&cfg.outlook, calendar_id, ev),
-        Source::Google => google::create(&cfg.google, calendar_id, ev),
-        Source::ICloud => icloud::create(&cfg.icloud, calendar_id, ev),
+/// Cria um evento num calendário da conta e devolve o id dele no serviço.
+pub fn create(cfg: &Config, acct: &Account, calendar_id: &str, ev: &NewEvent) -> Result<String> {
+    match acct.servico {
+        Source::Outlook => outlook::create(&cfg.outlook, &acct.id, calendar_id, ev),
+        Source::Google => google::create(&cfg.google, &acct.id, calendar_id, ev),
+        Source::ICloud => icloud::create(&acct.icloud(), calendar_id, ev),
+    }
+}
+
+/// Apaga um evento (`uid` = id no serviço; no iCloud, o UID).
+pub fn delete(cfg: &Config, acct: &Account, calendar_id: &str, uid: &str) -> Result<()> {
+    match acct.servico {
+        Source::Outlook => outlook::delete(&cfg.outlook, &acct.id, uid),
+        Source::Google => google::delete(&cfg.google, &acct.id, calendar_id, uid),
+        Source::ICloud => icloud::delete(&acct.icloud(), calendar_id, uid),
     }
 }
 
 /// O login desta conta permite criar eventos? (Outlook e Google pedem permissão
 /// de escrita; logins antigos, só de leitura, precisam conectar de novo.)
-pub fn can_write(src: Source) -> bool {
-    match src {
-        Source::Outlook => outlook::can_write(),
-        Source::Google => google::can_write(),
+pub fn can_write(acct: &Account) -> bool {
+    match acct.servico {
+        Source::Outlook => outlook::can_write(&acct.id),
+        Source::Google => google::can_write(&acct.id),
         Source::ICloud => true,
     }
 }
 
-pub fn enabled(cfg: &Config, src: Source) -> bool {
-    match src {
-        Source::Outlook => cfg.outlook.ativo,
-        Source::Google => cfg.google.ativo,
-        Source::ICloud => cfg.icloud.ativo,
+/// A conta está conectada (tem tokens ou senha de app)?
+pub fn connected(acct: &Account) -> bool {
+    match acct.servico {
+        Source::Outlook | Source::Google => crate::store::Tokens::load(&acct.id).is_some(),
+        Source::ICloud => !acct.senha_app.trim().is_empty(),
     }
 }
 

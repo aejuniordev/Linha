@@ -7,8 +7,6 @@ use chrono::{DateTime, Duration, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::model::Source;
-
 /// Pastas do usuário:
 /// - Windows: `%APPDATA%\Linha\config` e `%APPDATA%\Linha\data`
 /// - macOS:   `~/Library/Application Support/Linha`
@@ -46,8 +44,35 @@ pub fn cache_path() -> PathBuf {
     data_dir().join("cache.json")
 }
 
-fn token_path(src: Source) -> PathBuf {
-    data_dir().join("tokens").join(format!("{}.json", src.key()))
+/// Tokens de uma conta (`id` em `Config::contas`; as contas antigas usam o nome do serviço).
+fn token_path(account: &str) -> PathBuf {
+    // o id é gerado pelo Linha, mas não custa garantir um nome de arquivo seguro
+    let safe: String = account.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+    data_dir().join("tokens").join(format!("{safe}.json"))
+}
+
+/// Trava entre processos (janela e daemon podem sincronizar ao mesmo tempo).
+/// Devolve `None` se outro processo segura a trava há menos de `stale`.
+pub fn try_lock(name: &str, stale: std::time::Duration) -> Option<LockGuard> {
+    let path = data_dir().join(format!("{name}.lock"));
+    let _ = std::fs::create_dir_all(data_dir());
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().unwrap_or_default() < stale);
+    if fresh {
+        return None;
+    }
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&path).ok()?;
+    Some(LockGuard(path))
+}
+
+pub struct LockGuard(PathBuf);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Escreve em arquivo temporário e renomeia (atômico). Em Unix, permissão 0600.
@@ -96,17 +121,17 @@ impl Tokens {
         self.expires_at - Duration::seconds(90) > Utc::now()
     }
 
-    pub fn load(src: Source) -> Option<Tokens> {
-        let s = std::fs::read_to_string(token_path(src)).ok()?;
+    pub fn load(account: &str) -> Option<Tokens> {
+        let s = std::fs::read_to_string(token_path(account)).ok()?;
         serde_json::from_str(&s).ok()
     }
 
-    pub fn save(&self, src: Source) -> Result<()> {
-        write_private(&token_path(src), serde_json::to_string_pretty(self)?.as_bytes())
+    pub fn save(&self, account: &str) -> Result<()> {
+        write_private(&token_path(account), serde_json::to_string_pretty(self)?.as_bytes())
     }
 
-    pub fn delete(src: Source) {
-        let _ = std::fs::remove_file(token_path(src));
+    pub fn delete(account: &str) {
+        let _ = std::fs::remove_file(token_path(account));
     }
 }
 

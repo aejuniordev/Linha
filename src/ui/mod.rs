@@ -23,7 +23,7 @@ use eframe::egui::{
 use crate::config::Config;
 use crate::daemon::WINDOW_PORT;
 use crate::model::{Cache, Source};
-use crate::{demo, providers, sync};
+use crate::{demo, sync};
 use anim::{ease, ease_in, progress};
 use theme::{fade, font, font_named, Pal, LIGHT, MEDIUM};
 
@@ -203,11 +203,11 @@ impl LinhaApp {
         }
         let area = Rect::from_min_max(pos2(rect.left() + 20.0, rect.top() + 22.0), pos2(rect.right() - 20.0, rect.bottom() - 8.0));
         let Some(panel) = self.settings.as_mut() else { return };
-        let cals = &self.cache.calendars;
+        let cache = &self.cache;
         let out = ui
             .scope_builder(UiBuilder::new().max_rect(area), |ui| {
                 ui.multiply_opacity(alpha);
-                panel.show(ui, pal, cals)
+                panel.show(ui, pal, cache)
             })
             .inner;
         if out.changed {
@@ -600,18 +600,25 @@ impl LinhaApp {
         let y = rect.bottom() - FOOTER_H / 2.0 - 2.0;
         let syncing = self.syncing.load(Ordering::SeqCst);
         let mut items: Vec<(String, Color32, Option<String>)> = Vec::new();
-        for src in Source::ALL {
-            if !self.demo && !providers::enabled(&self.cfg, src) {
-                continue;
-            }
-            let st = self.cache.status.get(&src);
+        // uma bolinha por conta (na demonstração, uma por serviço)
+        let accounts: Vec<(String, String, String)> = if self.demo {
+            Source::ALL.iter().map(|s| (s.key().to_string(), s.label().to_string(), s.label().to_string())).collect()
+        } else {
+            self.cfg
+                .active_accounts()
+                .map(|a| (a.id.clone(), self.cfg.account_short(&a.id), self.cfg.account_label(&a.id)))
+                .collect()
+        };
+        for (id, short, full) in accounts {
+            let st = self.cache.status.get(&id);
             let (color, tip) = match st {
-                _ if syncing => (pal.tertiary, Some("sincronizando…".to_string())),
-                Some(s) if s.ok => (pal.green, Some(format!("{} evento(s)", s.count))),
-                Some(s) => (pal.red, s.message.clone()),
-                None => (pal.tertiary, Some("ainda não sincronizado".into())),
+                _ if syncing => (pal.tertiary, "sincronizando…".to_string()),
+                Some(s) if s.ok => (pal.green, format!("{} evento(s)", s.count)),
+                Some(s) => (pal.red, s.message.clone().unwrap_or_else(|| "falhou".into())),
+                None => (pal.tertiary, "ainda não sincronizado".into()),
             };
-            items.push((src.label().to_string(), color, tip));
+            let tip = if short == full { tip } else { format!("{full}\n{tip}") };
+            items.push((short, color, Some(tip)));
         }
         let right_text = if self.demo {
             "demonstração".to_string()

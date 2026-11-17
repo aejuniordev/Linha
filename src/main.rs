@@ -2,6 +2,7 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod blocks;
 mod config;
 mod daemon;
 mod demo;
@@ -29,8 +30,9 @@ USO
   linha demo                abre com uma agenda de exemplo
   linha daemon              roda em segundo plano: sincroniza e abre ao despertar
   linha sync                sincroniza agora e lista os eventos no terminal
-  linha login <conta>       conecta outlook | google pelo navegador
-  linha logout <conta>      desconecta outlook | google | icloud
+  linha login <serviço>     conecta mais uma conta outlook | google pelo navegador
+  linha logout <conta>      desconecta uma conta (e-mail, ou o serviço se só houver uma)
+  linha contas              lista as contas conectadas
   linha autostart on|off    inicia o daemon junto com o sistema
   linha pasta               mostra onde ficam as configurações
 
@@ -93,26 +95,41 @@ fn run() -> Result<()> {
             let mut cfg = Config::load()?;
             let flow = providers::oauth::Flow::default();
             let src = parse_source(arg(1))?;
-            match src {
+            let (tokens, who) = match src {
                 Source::Outlook => providers::outlook::login(&cfg.outlook, &flow)?,
                 Source::Google => providers::google::login(&cfg.google, &flow)?,
                 Source::ICloud => bail!("o iCloud usa Apple ID + senha de app: conecte pela tela de Ajustes (`linha ajustes`)"),
-            }
-            set_enabled(&mut cfg, src, true);
+            };
+            let id = cfg.upsert_account(src, &who, None);
+            tokens.save(&id)?;
             cfg.save()?;
-            println!("{} conectado.", src.label());
+            println!("{} conectado: {}", src.label(), cfg.account_label(&id));
             Ok(())
         }
         Some("logout") => {
             let mut cfg = Config::load()?;
-            let src = parse_source(arg(1))?;
-            store::Tokens::delete(src);
-            set_enabled(&mut cfg, src, false);
-            if src == Source::ICloud {
-                cfg.icloud.senha_app.clear();
-            }
+            let id = find_account(&cfg, arg(1))?;
+            let label = cfg.account_label(&id);
+            cfg.remove_account(&id);
             cfg.save()?;
-            println!("{}: desconectado.", src.label());
+            println!("{label}: desconectado.");
+            Ok(())
+        }
+        Some("contas") => {
+            let cfg = Config::load()?;
+            if cfg.contas.is_empty() {
+                println!("nenhuma conta conectada");
+            }
+            for a in &cfg.contas {
+                let principal = cfg.principal.as_ref().is_some_and(|p| p.account == a.id);
+                println!(
+                    "{:<8} {}{}{}",
+                    a.servico.label(),
+                    cfg.account_label(&a.id),
+                    if a.ativo { "" } else { "  (oculta)" },
+                    if principal { "  ← principal" } else { "" }
+                );
+            }
             Ok(())
         }
         Some("sync") => print_sync(),
@@ -135,11 +152,18 @@ fn run() -> Result<()> {
     }
 }
 
-fn set_enabled(cfg: &mut Config, src: Source, on: bool) {
-    match src {
-        Source::Outlook => cfg.outlook.ativo = on,
-        Source::Google => cfg.google.ativo = on,
-        Source::ICloud => cfg.icloud.ativo = on,
+/// Acha a conta por e-mail, id ou serviço (este só se houver uma conta dele).
+fn find_account(cfg: &Config, s: Option<&str>) -> Result<String> {
+    let s = s.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("diga qual conta (veja `linha contas`)"))?;
+    if let Some(a) = cfg.contas.iter().find(|a| a.id == s || a.nome.eq_ignore_ascii_case(s)) {
+        return Ok(a.id.clone());
+    }
+    let src = parse_source(Some(s))?;
+    let same: Vec<_> = cfg.contas.iter().filter(|a| a.servico == src).collect();
+    match same.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] => bail!("nenhuma conta {} conectada", src.label()),
+        _ => bail!("há mais de uma conta {}: diga o e-mail (veja `linha contas`)", src.label()),
     }
 }
 
@@ -158,11 +182,12 @@ fn print_sync() -> Result<()> {
         bail!("nenhuma conta conectada — abra os Ajustes (`linha ajustes`) e conecte pelo menos uma");
     }
     let cache = sync::sync_all(&cfg);
-    for (src, st) in &cache.status {
+    for (id, st) in &cache.status {
+        let name = cfg.account_label(id);
         match (&st.ok, &st.message) {
-            (true, _) => println!("✓ {:<8} {} evento(s)", src.label(), st.count),
-            (false, Some(m)) => println!("✗ {:<8} {m}", src.label()),
-            (false, None) => println!("✗ {}", src.label()),
+            (true, _) => println!("✓ {name}  {} evento(s)", st.count),
+            (false, Some(m)) => println!("✗ {name}  {m}"),
+            (false, None) => println!("✗ {name}"),
         }
     }
     println!();
@@ -175,7 +200,7 @@ fn print_sync() -> Result<()> {
                 When::AllDay { .. } => "dia todo     ".to_string(),
                 When::Timed { .. } => format!("{}–{}  ", e.local_start().format("%H:%M"), e.local_end().format("%H:%M")),
             };
-            println!("  {when}{}  ({} · {})", e.title, e.calendar, e.source.label());
+            println!("  {when}{}  ({} · {})", e.title, e.calendar, cfg.account_label(&e.account));
         }
     }
     Ok(())

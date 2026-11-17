@@ -44,7 +44,13 @@ No Windows o Linha fica na **área de notificação**, ao lado do relógio. Cliq
 
 ### Criar eventos
 
-Escolha um **calendário principal** em *Ajustes → Calendário principal* (ou na primeira vez que criar um evento). O **+** abre a tela *Novo evento*: título, local, dia (com calendário), horário ou dia inteiro. O evento é criado no principal, mas dá para escolher outro calendário na hora. Funciona com Outlook, Google e iCloud.
+Escolha um **calendário principal** em *Ajustes → Calendário principal* (ou na primeira vez que criar um evento). O **+** abre a tela *Novo evento*: título, local, descrição, início e fim, repetição, lembrete, disponibilidade, convidados e reunião online (os campos se ajustam ao serviço). O evento é criado no principal, mas dá para escolher outro calendário — de qualquer conta — na hora. Funciona com Outlook, Google e iCloud.
+
+### Bloquear horários entre contas
+
+Com várias contas (por exemplo, um Gmail pessoal e um Outlook do trabalho), ative *Ajustes → Bloquear horários*. Para cada compromisso dos calendários marcados nas outras contas, o Linha cria no **calendário principal** um evento "Ocupado" — particular, sem título nem detalhes do original e sem lembrete — e o mantém em dia a cada sincronização: muda junto se o original mudar de horário e some se ele for apagado. Compromissos sobrepostos viram um bloqueio só; eventos de dia inteiro ou marcados como disponíveis ficam de fora. Os bloqueios vão até 14 dias à frente. Desligar a opção apaga os bloqueios futuros.
+
+Os bloqueios não aparecem duplicados na linha do tempo. Se alguma conta falhar ao sincronizar, a rodada de bloqueios espera a próxima, para não apagar nem criar nada com informação incompleta.
 
 Pelo terminal também dá:
 
@@ -54,8 +60,9 @@ linha ajustes             abre direto nos Ajustes
 linha demo                abre com uma agenda de exemplo
 linha daemon              roda em segundo plano: sincroniza e abre ao despertar
 linha sync                sincroniza agora e lista os eventos no terminal
-linha login <conta>       conecta outlook | google pelo navegador
-linha logout <conta>      desconecta outlook | google | icloud
+linha login <serviço>     conecta mais uma conta outlook | google pelo navegador
+linha logout <conta>      desconecta uma conta (e-mail, ou o serviço se só houver uma)
+linha contas              lista as contas conectadas
 linha autostart on|off    inicia o daemon junto com o sistema
 linha pasta               mostra onde ficam as configurações
 ```
@@ -78,10 +85,12 @@ O Linha procura uma versão nova nas releases do GitHub logo depois de iniciar e
 
 Em **Ajustes → Contas**:
 
-- **Outlook / Microsoft 365 / Hotmail** e **Google Agenda (Gmail)**: clique em **Conectar**. O navegador abre na página de login da Microsoft ou do Google; depois de autorizar, a aba mostra “Pronto ✓” e a conta aparece como conectada. Por baixo é OAuth 2.0 com PKCE e retorno capturado em `127.0.0.1`. O Linha pede permissão para ler a agenda e criar eventos; ele nunca altera nem apaga o que já existe.
-- **iCloud**: a Apple não oferece login por navegador para agendas. Gere uma **senha de app** em account.apple.com → *Entrar e segurança → Senhas de app* (o link está nos Ajustes), informe o Apple ID e a senha e clique em **Conectar**. O iCloud é lido via CalDAV; eventos recorrentes são expandidos pelo servidor ou, se ele não expandir, localmente (diário, semanal, mensal, anual com `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`, `BYMONTH`, exceções e datas removidas).
+- **Outlook / Microsoft 365 / Hotmail** e **Google Agenda (Gmail)**: em *Adicionar conta*, clique em **+ Outlook** ou **+ Google**. O navegador abre na página de login da Microsoft ou do Google; depois de autorizar, a aba mostra “Pronto ✓” e a conta aparece na lista com o e-mail. Por baixo é OAuth 2.0 com PKCE e retorno capturado em `127.0.0.1`. O Linha pede permissão para ler a agenda e criar eventos; ele nunca altera nem apaga eventos seus — só os bloqueios de horário que ele mesmo criou.
+- **iCloud**: a Apple não oferece login por navegador para agendas. Gere uma **senha de app** em account.apple.com → *Entrar e segurança → Senhas de app* (o link está nos Ajustes), clique em **+ iCloud**, informe o Apple ID e a senha e clique em **Conectar**. O iCloud é lido via CalDAV; eventos recorrentes são expandidos pelo servidor ou, se ele não expandir, localmente (diário, semanal, mensal, anual com `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`, `BYMONTH`, exceções e datas removidas).
 
-Cada conta conectada pode ser escondida da linha do tempo sem desconectar. **Desconectar** apaga os tokens do computador.
+Dá para conectar **várias contas do mesmo serviço** (pessoal e trabalho, por exemplo): é só usar o botão de novo e escolher outra conta no navegador. Entrar outra vez na mesma conta só renova o acesso. Cada conta pode ser escondida da linha do tempo sem desconectar; **Desconectar** apaga os tokens dela do computador.
+
+Quem atualiza de uma versão com uma conta por serviço não precisa reconectar: as contas e os tokens existentes são aproveitados.
 
 > Para quem mantém o projeto: os apps OAuth da Microsoft e do Google são embutidos no build. Veja [docs/OAUTH.md](docs/OAUTH.md).
 
@@ -97,7 +106,7 @@ Os botões *Abrir pasta* nos Ajustes levam direto até elas. O `config.toml` é 
 
 ## Privacidade
 
-- O Linha lê suas agendas e só escreve quando você cria um evento. Nada passa por servidores intermediários.
+- O Linha lê suas agendas e só escreve quando você cria um evento ou quando o bloqueio de horários está ligado (e aí só cria e apaga os próprios eventos "Ocupado", sem copiar título ou detalhes). Nada passa por servidores intermediários.
 - Tokens OAuth, a configuração e o cache de eventos são gravados com permissão `0600` (Unix).
 - A senha de app do iCloud fica no `config.toml`. Ela pode ser revogada a qualquer momento no site da Apple; *Desconectar* a apaga do computador.
 
@@ -106,10 +115,11 @@ Os botões *Abrir pasta* nos Ajustes levam direto até elas. O `config.toml` é 
 ```text
 src/
   main.rs            comandos de terminal
-  config.rs          preferências (config.toml) e IDs OAuth embutidos
+  config.rs          preferências (config.toml), contas e IDs OAuth embutidos
   model.rs           Evento, origem, cache
   store.rs           pastas do usuário, escrita atômica, tokens
   sync.rs            sincroniza as contas em paralelo
+  blocks.rs          bloqueio de horários entre contas (com testes)
   daemon.rs          segundo plano, detecção de despertar, início automático
   update.rs          atualização automática pelas releases do GitHub
   demo.rs            agenda de exemplo

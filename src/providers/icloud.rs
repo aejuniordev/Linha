@@ -6,9 +6,9 @@ use reqwest::blocking::Client;
 use reqwest::Method;
 use url::Url;
 
-use super::{check, client, ics};
+use super::{check, client, ics, Fetched};
 use crate::config::ICloudCfg;
-use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Reminder, ShowAs, Source, When, DEFAULT_COLOR};
+use crate::model::{parse_hex_color, CalendarInfo, NewEvent, Reminder, ShowAs, Source, When, DEFAULT_COLOR};
 
 const ROOT: &str = "https://caldav.icloud.com/";
 const NS_DAV: &str = "DAV:";
@@ -121,7 +121,7 @@ fn discover(dav: &Dav) -> Result<Vec<CalInfo>> {
     Ok(cals)
 }
 
-pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(Vec<Event>, Vec<CalendarInfo>)> {
+pub fn fetch(cfg: &ICloudCfg, account: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Fetched> {
     if cfg.apple_id.trim().is_empty() || cfg.senha_app.trim().is_empty() {
         bail!("iCloud: conecte a conta em Ajustes (Apple ID + senha de app)");
     }
@@ -141,7 +141,16 @@ pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
     let cals = discover(&dav)?;
     let infos = cals
         .iter()
-        .map(|c| CalendarInfo { source: Source::ICloud, id: c.url.to_string(), name: c.name.clone(), color: c.color, writable: true, meeting: None })
+        .map(|c| CalendarInfo {
+            source: Source::ICloud,
+            account: account.to_string(),
+            primary: false,
+            id: c.url.to_string(),
+            name: c.name.clone(),
+            color: c.color,
+            writable: true,
+            meeting: None,
+        })
         .collect();
     for cal in cals {
         let xml = dav.request("REPORT", &cal.url, "1", query.clone())?;
@@ -152,10 +161,31 @@ pub fn fetch(cfg: &ICloudCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
                 vevents.extend(ics::parse_vevents(text));
             }
         }
-        out.extend(ics::expand(&vevents, from, to, &cal.name, cal.color, Source::ICloud));
+        let target = ics::Target { account, calendar_id: cal.url.as_str(), name: &cal.name, color: cal.color, source: Source::ICloud };
+        out.extend(ics::expand(&vevents, from, to, &target));
     }
-    Ok((out, infos))
+    Ok(Fetched { events: out, calendars: infos, who: Some(cfg.apple_id.trim().to_string()) })
 }
+
+/// Apaga um evento criado pelo Linha (o arquivo é `<uid>.ics` no calendário).
+/// Já apagado (404) conta como sucesso.
+pub fn delete(cfg: &ICloudCfg, calendar_url: &str, uid: &str) -> Result<()> {
+    let base = Url::parse(calendar_url).context("iCloud: endereço de calendário inválido")?;
+    let url = base.join(&format!("{uid}.ics"))?;
+    let resp = client()
+        .delete(url)
+        .basic_auth(cfg.apple_id.trim(), Some(cfg.senha_app.trim()))
+        .send()
+        .context("iCloud: sem conexão com o servidor")?;
+    if resp.status().as_u16() == 404 {
+        return Ok(());
+    }
+    check(resp, "iCloud (apagar evento)")?;
+    Ok(())
+}
+
+/// Propriedade que marca os bloqueios criados pelo Linha.
+pub const BLOCK_PROP: &str = "X-LINHA-BLOQUEIO";
 
 /// Testa as credenciais. Devolve os nomes dos calendários encontrados.
 pub fn login(cfg: &ICloudCfg) -> Result<Vec<String>> {
@@ -166,8 +196,8 @@ pub fn login(cfg: &ICloudCfg) -> Result<Vec<String>> {
     Ok(discover(&dav)?.into_iter().map(|c| c.name).collect())
 }
 
-/// Cria um evento no calendário cujo endereço CalDAV é `calendar_url`.
-pub fn create(cfg: &ICloudCfg, calendar_url: &str, ev: &NewEvent) -> Result<()> {
+/// Cria um evento no calendário cujo endereço CalDAV é `calendar_url` e devolve o UID.
+pub fn create(cfg: &ICloudCfg, calendar_url: &str, ev: &NewEvent) -> Result<String> {
     use rand::distr::{Alphanumeric, SampleString};
 
     if cfg.apple_id.trim().is_empty() || cfg.senha_app.trim().is_empty() {
@@ -219,6 +249,9 @@ pub fn create(cfg: &ICloudCfg, calendar_url: &str, ev: &NewEvent) -> Result<()> 
     if ev.private {
         lines.push("CLASS:PRIVATE".into());
     }
+    if ev.block {
+        lines.push(format!("{BLOCK_PROP}:1"));
+    }
     if let Reminder::Minutes(m) = ev.reminder {
         lines.extend([
             "BEGIN:VALARM".into(),
@@ -243,7 +276,7 @@ pub fn create(cfg: &ICloudCfg, calendar_url: &str, ev: &NewEvent) -> Result<()> 
         bail!("iCloud: Apple ID ou senha de app incorretos");
     }
     check(resp, "iCloud (criar evento)")?;
-    Ok(())
+    Ok(uid)
 }
 
 /// Escapa texto para iCalendar (RFC 5545 §3.3.11).

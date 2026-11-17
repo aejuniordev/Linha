@@ -73,8 +73,8 @@ pub struct Compose {
     attendees: String,
     meeting: bool,
 
-    /// Calendário escolhido: (origem, id).
-    target: Option<(Source, String)>,
+    /// Calendário escolhido: (conta, id do calendário).
+    target: Option<(String, String)>,
     make_principal: bool,
     pending: Option<Slot>,
     error: Option<String>,
@@ -106,7 +106,7 @@ impl Compose {
             private: false,
             attendees: String::new(),
             meeting: false,
-            target: cfg.principal.as_ref().map(|p| (p.source, p.id.clone())),
+            target: cfg.principal.as_ref().map(|p| (p.account.clone(), p.id.clone())),
             make_principal: cfg.principal.is_none(),
             pending: None,
             error: None,
@@ -144,19 +144,19 @@ impl Compose {
         let busy = self.pending.is_some();
 
         let writable: Vec<&CalendarInfo> =
-            calendars.iter().filter(|c| c.writable && providers::enabled(cfg, c.source)).collect();
-        let valid = |t: Option<(Source, &str)>| t.is_some_and(|(s, id)| writable.iter().any(|c| c.source == s && c.id == id));
-        if !valid(self.target.as_ref().map(|(s, id)| (*s, id.as_str()))) {
+            calendars.iter().filter(|c| c.writable && cfg.active(&c.account)).collect();
+        let valid = |t: Option<(&str, &str)>| t.is_some_and(|(a, id)| writable.iter().any(|c| c.account == a && c.id == id));
+        if !valid(self.target.as_ref().map(|(a, id)| (a.as_str(), id.as_str()))) {
             // sem escolha válida (conta desconectada, lista ainda vazia…): principal, senão o primeiro
-            let principal = cfg.principal.as_ref().map(|p| (p.source, p.id.as_str()));
+            let principal = cfg.principal.as_ref().map(|p| (p.account.as_str(), p.id.as_str()));
             self.target = if valid(principal) {
-                principal.map(|(s, id)| (s, id.to_string()))
+                principal.map(|(a, id)| (a.to_string(), id.to_string()))
             } else {
-                writable.first().map(|c| (c.source, c.id.clone()))
+                writable.first().map(|c| (c.account.clone(), c.id.clone()))
             };
         }
         let target: Option<&CalendarInfo> =
-            self.target.as_ref().and_then(|(s, id)| writable.iter().copied().find(|c| c.source == *s && &c.id == id));
+            self.target.as_ref().and_then(|(a, id)| writable.iter().copied().find(|c| &c.account == a && &c.id == id));
         let src = target.map(|c| c.source);
         self.fit_to(src, target);
 
@@ -207,24 +207,24 @@ impl Compose {
                         hint(ui, pal, "Nenhum calendário disponível para escrita. Conecte uma conta em Ajustes e sincronize. Se o Outlook ou o Google já estavam conectados, conecte de novo para dar permissão de criar eventos.");
                         return;
                     }
-                    let current = target.map(label).unwrap_or_else(|| "Escolha…".into());
+                    let current = target.map(|c| label(cfg, c)).unwrap_or_else(|| "Escolha…".into());
                     egui::ComboBox::from_id_salt("calendario").selected_text(current).width(ui.available_width()).show_ui(ui, |ui| {
                         for c in &writable {
-                            let sel = self.target.as_ref().is_some_and(|(s, id)| *s == c.source && id == &c.id);
-                            if ui.selectable_label(sel, label(c)).clicked() {
-                                self.target = Some((c.source, c.id.clone()));
+                            let sel = self.target.as_ref().is_some_and(|(a, id)| a == &c.account && id == &c.id);
+                            if ui.selectable_label(sel, label(cfg, c)).clicked() {
+                                self.target = Some((c.account.clone(), c.id.clone()));
                             }
                         }
                     });
                     let is_principal = cfg.principal.as_ref().is_some_and(|p| {
-                        self.target.as_ref().is_some_and(|(s, id)| p.source == *s && &p.id == id)
+                        self.target.as_ref().is_some_and(|(a, id)| &p.account == a && &p.id == id)
                     });
                     if !is_principal {
                         ui.checkbox(&mut self.make_principal, "Usar como calendário principal");
                     }
-                    if let Some(s) = src {
-                        if !providers::can_write(s) {
-                            hint(ui, pal, &format!("Conecte o {} de novo em Ajustes para permitir criar eventos.", s.label()));
+                    if let Some(acct) = target.and_then(|c| cfg.account(&c.account)) {
+                        if !providers::can_write(acct) {
+                            hint(ui, pal, &format!("Conecte {} de novo em Ajustes para permitir criar eventos.", cfg.account_label(&acct.id)));
                         }
                     }
                 });
@@ -438,9 +438,9 @@ impl Compose {
     }
 
     fn principal(&self, calendars: &[CalendarInfo]) -> Option<Principal> {
-        let (s, id) = self.target.as_ref()?;
-        let c = calendars.iter().find(|c| c.source == *s && &c.id == id)?;
-        Some(Principal { source: c.source, id: c.id.clone(), name: c.name.clone() })
+        let (a, id) = self.target.as_ref()?;
+        let c = calendars.iter().find(|c| &c.account == a && &c.id == id)?;
+        Some(Principal { account: c.account.clone(), source: c.source, id: c.id.clone(), name: c.name.clone() })
     }
 
     /// Monta o evento a partir do formulário (ou diz o que está errado).
@@ -499,11 +499,13 @@ impl Compose {
             private: self.private,
             attendees,
             online_meeting: if self.meeting { target.and_then(|c| c.meeting.clone()) } else { None },
+            block: false,
         })
     }
 
     fn save(&mut self, cfg: &Config, ctx: &egui::Context, target: Option<&CalendarInfo>) {
-        let Some((src, id)) = self.target.clone() else { return };
+        let Some((account, id)) = self.target.clone() else { return };
+        let Some(acct) = cfg.account(&account).cloned() else { return };
         let ev = match self.build(target) {
             Ok(ev) => ev,
             Err(e) => {
@@ -515,7 +517,7 @@ impl Compose {
         let slot: Slot = Arc::default();
         let (s, cfg, ctx) = (slot.clone(), cfg.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let res = providers::create(&cfg, src, &id, &ev).map_err(|e| format!("{e:#}"));
+            let res = providers::create(&cfg, &acct, &id, &ev).map(|_| ()).map_err(|e| format!("{e:#}"));
             *s.lock().unwrap() = Some(res);
             ctx.request_repaint();
         });
@@ -581,8 +583,8 @@ fn parse_emails(s: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn label(c: &CalendarInfo) -> String {
-    format!("{} · {}", c.name, c.source.label())
+fn label(cfg: &Config, c: &CalendarInfo) -> String {
+    format!("{} · {}", c.name, cfg.account_label(&c.account))
 }
 
 fn at_minutes(day: NaiveDate, mins: u32) -> NaiveDateTime {

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use url::Url;
 
 use super::oauth::{self, Flow};
-use super::{check, client};
+use super::{check, client, Fetched};
 use crate::config::GoogleCfg;
 use crate::model::{parse_hex_color, CalendarInfo, Event, NewEvent, Reminder, ShowAs, Source, When, DEFAULT_COLOR};
 use crate::store::{TokenResponse, Tokens};
@@ -23,8 +23,9 @@ fn credentials(cfg: &GoogleCfg) -> Result<(String, String)> {
     cfg.credentials().ok_or_else(|| anyhow!("Google: esta versão do Linha foi compilada sem o app do Google (veja docs/OAUTH.md)"))
 }
 
-/// Abre o navegador para a pessoa entrar na conta Google e guarda os tokens.
-pub fn login(cfg: &GoogleCfg, flow: &Flow) -> Result<()> {
+/// Abre o navegador para a pessoa entrar numa conta Google. Devolve os tokens
+/// (ainda não gravados) e o e-mail da conta.
+pub fn login(cfg: &GoogleCfg, flow: &Flow) -> Result<(Tokens, String)> {
     let (id, secret) = credentials(cfg)?;
     let grant = oauth::authorize(
         flow,
@@ -53,12 +54,23 @@ pub fn login(cfg: &GoogleCfg, flow: &Flow) -> Result<()> {
     let tr: TokenResponse = check(resp, "Google (trocar código)")?.json()?;
     let mut t = Tokens::from_response(&tr, None);
     t.scope.get_or_insert_with(|| SCOPE.into());
-    t.save(Source::Google)
+    let who = whoami(&t.access_token).unwrap_or_default();
+    Ok((t, who))
 }
 
-fn access_token(cfg: &GoogleCfg) -> Result<String> {
+/// E-mail da conta: o id do calendário principal.
+fn whoami(token: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Primary {
+        id: String,
+    }
+    let resp = client().get(format!("{API}/calendars/primary")).bearer_auth(token).send()?;
+    Ok(check(resp, "Google (conta)")?.json::<Primary>()?.id)
+}
+
+fn access_token(cfg: &GoogleCfg, account: &str) -> Result<String> {
     let (id, secret) = credentials(cfg)?;
-    let tokens = Tokens::load(Source::Google).ok_or_else(|| anyhow!("Google: conecte a conta em Ajustes"))?;
+    let tokens = Tokens::load(account).ok_or_else(|| anyhow!("Google: conecte a conta em Ajustes"))?;
     if tokens.is_fresh() {
         return Ok(tokens.access_token);
     }
@@ -74,7 +86,7 @@ fn access_token(cfg: &GoogleCfg) -> Result<String> {
         .send().context("Google: sem conexão com o servidor")?;
     let tr: TokenResponse = check(resp, "Google (renovar sessão)")?.json()?;
     let t = Tokens::from_response(&tr, Some(&tokens));
-    t.save(Source::Google)?;
+    t.save(account)?;
     Ok(t.access_token)
 }
 
@@ -96,6 +108,8 @@ struct CalEntry {
     hidden: Option<bool>,
     access_role: Option<String>,
     conference_properties: Option<ConferenceProps>,
+    #[serde(default)]
+    primary: bool,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +139,16 @@ struct GEvent {
     end: Option<GTime>,
     #[serde(default)]
     attendees: Vec<Attendee>,
+    /// "transparent" = disponível.
+    transparency: Option<String>,
+    #[serde(rename = "extendedProperties")]
+    extended: Option<Extended>,
+}
+
+#[derive(Deserialize)]
+struct Extended {
+    #[serde(default)]
+    private: std::collections::HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -156,8 +180,8 @@ fn parse_when(start: &GTime, end: &GTime) -> Result<When> {
     Ok(When::AllDay { start: s, end: e })
 }
 
-pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(Vec<Event>, Vec<CalendarInfo>)> {
-    let token = access_token(cfg)?;
+pub fn fetch(cfg: &GoogleCfg, account: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Fetched> {
+    let token = access_token(cfg, account)?;
     let http = client();
 
     let mut cals = Vec::new();
@@ -177,11 +201,15 @@ pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
 
     let mut out = Vec::new();
     let mut infos = Vec::new();
+    // o id do calendário principal é o e-mail da conta
+    let who = cals.iter().find(|c| c.primary).map(|c| c.id.clone());
     for cal in cals.into_iter().filter(|c| c.selected != Some(false) && c.hidden != Some(true)) {
         let color = cal.background_color.as_deref().and_then(parse_hex_color).unwrap_or(DEFAULT_COLOR);
         let cal_name = cal.summary_override.or(cal.summary).unwrap_or_else(|| "Google".into());
         infos.push(CalendarInfo {
             source: Source::Google,
+            account: account.to_string(),
+            primary: cal.primary,
             id: cal.id.clone(),
             name: cal_name.clone(),
             color,
@@ -215,8 +243,9 @@ pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
                 }
                 let (Some(s), Some(en)) = (&e.start, &e.end) else { continue };
                 let Ok(when) = parse_when(s, en) else { continue };
+                let block = e.extended.as_ref().and_then(|x| x.private.get(BLOCK_KEY)).is_some_and(|v| v == BLOCK_VALUE);
                 out.push(Event {
-                    id: format!("google:{}", e.id),
+                    id: format!("{account}:{}", e.id),
                     title: e.summary.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "(sem título)".into()),
                     when,
                     location: e.location.filter(|s| !s.trim().is_empty()),
@@ -224,6 +253,11 @@ pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
                     color,
                     source: Source::Google,
                     link: e.html_link,
+                    account: account.to_string(),
+                    calendar_id: cal.id.clone(),
+                    uid: e.id,
+                    free: e.transparency.as_deref() == Some("transparent"),
+                    block,
                 });
             }
             page = list.next_page_token;
@@ -232,20 +266,37 @@ pub fn fetch(cfg: &GoogleCfg, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
             }
         }
     }
-    Ok((out, infos))
+    Ok(Fetched { events: out, calendars: infos, who })
 }
 
-/// O login atual permite criar eventos?
-pub fn can_write() -> bool {
-    Tokens::load(Source::Google).is_some_and(|t| t.has_scope(WRITE_SCOPE))
+/// Marca (em `extendedProperties.private`) dos bloqueios criados pelo Linha.
+const BLOCK_KEY: &str = "linha";
+const BLOCK_VALUE: &str = "bloqueio";
+
+/// O login desta conta permite criar eventos?
+pub fn can_write(account: &str) -> bool {
+    Tokens::load(account).is_some_and(|t| t.has_scope(WRITE_SCOPE))
 }
 
-/// Cria um evento no calendário `calendar_id`.
-pub fn create(cfg: &GoogleCfg, calendar_id: &str, ev: &NewEvent) -> Result<()> {
-    if !can_write() {
+/// Apaga um evento. Já apagado (404/410) conta como sucesso.
+pub fn delete(cfg: &GoogleCfg, account: &str, calendar_id: &str, event_id: &str) -> Result<()> {
+    let token = access_token(cfg, account)?;
+    let mut url = Url::parse(API)?;
+    url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["calendars", calendar_id, "events", event_id]);
+    let resp = client().delete(url).bearer_auth(&token).send().context("Google: sem conexão com o servidor")?;
+    if matches!(resp.status().as_u16(), 404 | 410) {
+        return Ok(());
+    }
+    check(resp, "Google (apagar evento)")?;
+    Ok(())
+}
+
+/// Cria um evento no calendário `calendar_id` e devolve o id dele.
+pub fn create(cfg: &GoogleCfg, account: &str, calendar_id: &str, ev: &NewEvent) -> Result<String> {
+    if !can_write(account) {
         anyhow::bail!("Google: conecte a conta de novo em Ajustes para permitir criar eventos");
     }
-    let token = access_token(cfg)?;
+    let token = access_token(cfg, account)?;
     let body = event_body(ev);
     let mut url = Url::parse(API)?;
     url.path_segments_mut().map_err(|_| anyhow!("url"))?.extend(["calendars", calendar_id, "events"]);
@@ -263,8 +314,11 @@ pub fn create(cfg: &GoogleCfg, calendar_id: &str, ev: &NewEvent) -> Result<()> {
         .json(&body)
         .send()
         .context("Google: sem conexão com o servidor")?;
-    check(resp, "Google (criar evento)")?;
-    Ok(())
+    #[derive(Deserialize)]
+    struct Created {
+        id: String,
+    }
+    Ok(check(resp, "Google (criar evento)")?.json::<Created>().context("Google: resposta ao criar evento")?.id)
 }
 
 /// Corpo JSON de um evento novo (Calendar API v3, `events.insert`).
@@ -317,6 +371,9 @@ fn event_body(ev: &NewEvent) -> serde_json::Value {
                 "conferenceSolutionKey": { "type": provider },
             }
         });
+    }
+    if ev.block {
+        body["extendedProperties"] = json!({ "private": { BLOCK_KEY: BLOCK_VALUE } });
     }
     body
 }

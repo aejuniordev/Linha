@@ -25,6 +25,11 @@ pub fn cache() -> Cache {
             color,
             source,
             link: None,
+            account: source.key().into(),
+            calendar_id: cal.into(),
+            uid: format!("demo-{n}"),
+            free: false,
+            block: false,
         }
     };
     let timed = |a: i64, b: i64| When::Timed { start: at(a).with_timezone(&Utc), end: at(b).with_timezone(&Utc) };
@@ -53,7 +58,7 @@ pub fn cache() -> Cache {
     let mut cache = Cache { updated: Some(Utc::now() - Duration::minutes(2)), events, ..Default::default() };
     for src in Source::ALL {
         let count = cache.events.iter().filter(|e| e.source == src).count();
-        cache.status.insert(src, SyncStatus { ok: true, message: None, at: cache.updated, count });
+        cache.status.insert(src.key().into(), SyncStatus { ok: true, message: None, at: cache.updated, count, who: None });
     }
     cache
 }

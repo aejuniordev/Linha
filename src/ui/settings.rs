@@ -1,5 +1,6 @@
-//! Tela de Ajustes: contas (login pelo navegador) e preferências.
-//! Tudo é gravado sozinho em `config.toml`, na pasta de configuração do usuário.
+//! Tela de Ajustes: contas (login pelo navegador), calendário principal, bloqueio
+//! de horários e preferências. Tudo é gravado sozinho em `config.toml`, na pasta
+//! de configuração do usuário.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -7,18 +8,43 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, Align, Button, Color32, CornerRadius, Layout, Margin, RichText, Ui};
 
 use super::theme::{fade, font, font_named, Pal, MEDIUM, SEMIBOLD};
-use crate::config::{Config, Principal};
-use crate::model::{CalendarInfo, Source};
+use crate::config::{Account, CalRef, Config, ICloudCfg, Principal};
+use crate::model::{Cache, CalendarInfo, Source};
 use crate::providers::oauth::Flow;
+use crate::store::Tokens;
 use crate::{daemon, providers, store, update};
 
 const APPLE_APP_PASSWORDS: &str = "https://account.apple.com/account/manage";
 
+/// Resultado de um login que deu certo.
+struct LoginOk {
+    /// Outlook/Google: tokens ainda não gravados (o id da conta sai depois).
+    tokens: Option<Tokens>,
+    /// E-mail da conta (ou Apple ID).
+    who: String,
+    /// iCloud: (Apple ID, senha de app).
+    apple: Option<(String, String)>,
+    note: String,
+}
+
 /// Login rodando numa thread.
 struct Pending {
     src: Source,
+    /// Reconectar esta conta (em vez de adicionar uma nova).
+    reuse: Option<String>,
     flow: Arc<Flow>,
-    result: Arc<Mutex<Option<Result<String, String>>>>,
+    result: Arc<Mutex<Option<Result<LoginOk, String>>>>,
+}
+
+impl Pending {
+    /// Chave das mensagens: a conta, ou "novo:<serviço>" ao adicionar.
+    fn key(&self) -> String {
+        self.reuse.clone().unwrap_or_else(|| new_key(self.src))
+    }
+}
+
+fn new_key(src: Source) -> String {
+    format!("novo:{}", src.key())
 }
 
 /// O que a janela precisa fazer depois de desenhar os Ajustes.
@@ -27,7 +53,7 @@ pub struct Outcome {
     pub close: bool,
     /// A config mudou (e já foi gravada).
     pub changed: bool,
-    /// Uma conta acabou de ser conectada: vale sincronizar já.
+    /// Vale sincronizar já (conta conectada, bloqueio mudou…).
     pub sync: bool,
     /// Versão nova instalada e a pessoa pediu para reiniciar.
     pub restart: bool,
@@ -37,8 +63,12 @@ pub struct Settings {
     pub cfg: Config,
     saved: Config,
     pending: Option<Pending>,
-    /// Última mensagem por conta: (ok, texto).
-    notes: HashMap<Source, (bool, String)>,
+    /// Última mensagem por conta (ou "novo:<serviço>"): (ok, texto).
+    notes: HashMap<String, (bool, String)>,
+    /// Formulário "Adicionar iCloud" aberto e o que foi digitado.
+    icloud_form: bool,
+    apple_id: String,
+    senha_app: String,
     error: Option<String>,
     /// Verificação manual de atualização em andamento / último resultado.
     update_job: Option<Arc<Mutex<Option<Result<update::Outcome, String>>>>>,
@@ -52,12 +82,14 @@ impl Settings {
             saved: cfg.clone(),
             pending: None,
             notes: HashMap::new(),
+            icloud_form: false,
+            apple_id: String::new(),
+            senha_app: String::new(),
             error: None,
             update_job: None,
             update_note: None,
         }
     }
-
 
     /// Cancela um login em andamento (ao fechar a tela).
     pub fn cancel(&mut self) {
@@ -66,76 +98,97 @@ impl Settings {
         }
     }
 
-    fn connected(&self, src: Source) -> bool {
+    fn available(&self, src: Source) -> bool {
         match src {
-            Source::Outlook | Source::Google => store::Tokens::load(src).is_some(),
-            Source::ICloud => self.cfg.icloud.ativo && !self.cfg.icloud.senha_app.trim().is_empty(),
+            Source::Outlook => self.cfg.outlook.client_id().is_some(),
+            Source::Google => self.cfg.google.credentials().is_some(),
+            Source::ICloud => true,
         }
     }
 
-    fn start_login(&mut self, src: Source, ctx: &egui::Context) {
+    /// Abre o login. `reuse` = reconectar essa conta; `None` = adicionar uma nova.
+    fn start_login(&mut self, src: Source, reuse: Option<String>, ctx: &egui::Context) {
         self.cancel();
         let flow = Arc::new(Flow::default());
         let result = Arc::new(Mutex::new(None));
         let (cfg, f, r, ctx) = (self.cfg.clone(), flow.clone(), result.clone(), ctx.clone());
+        let apple = (self.apple_id.trim().to_string(), self.senha_app.trim().to_string());
         std::thread::spawn(move || {
             let res = match src {
-                Source::Outlook => providers::outlook::login(&cfg.outlook, &f).map(|_| "Conectado".to_string()),
-                Source::Google => providers::google::login(&cfg.google, &f).map(|_| "Conectado".to_string()),
-                Source::ICloud => providers::icloud::login(&cfg.icloud).map(|cals| match cals.len() {
-                    1 => "Conectado · 1 calendário".to_string(),
-                    n => format!("Conectado · {n} calendários"),
-                }),
+                Source::Outlook => providers::outlook::login(&cfg.outlook, &f)
+                    .map(|(t, who)| LoginOk { tokens: Some(t), who, apple: None, note: "Conectado".into() }),
+                Source::Google => providers::google::login(&cfg.google, &f)
+                    .map(|(t, who)| LoginOk { tokens: Some(t), who, apple: None, note: "Conectado".into() }),
+                Source::ICloud => {
+                    let ic = ICloudCfg { ativo: true, apple_id: apple.0.clone(), senha_app: apple.1.clone() };
+                    providers::icloud::login(&ic).map(|cals| LoginOk {
+                        tokens: None,
+                        who: apple.0.clone(),
+                        apple: Some(apple.clone()),
+                        note: match cals.len() {
+                            1 => "Conectado · 1 calendário".into(),
+                            n => format!("Conectado · {n} calendários"),
+                        },
+                    })
+                }
             };
             *r.lock().unwrap() = Some(res.map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
         });
-        self.notes.remove(&src);
-        self.pending = Some(Pending { src, flow, result });
-    }
-
-    fn disconnect(&mut self, src: Source) {
-        store::Tokens::delete(src);
-        match src {
-            Source::Outlook => self.cfg.outlook.ativo = false,
-            Source::Google => self.cfg.google.ativo = false,
-            Source::ICloud => {
-                self.cfg.icloud.ativo = false;
-                self.cfg.icloud.senha_app.clear();
-            }
-        }
-        self.notes.insert(src, (true, "Desconectado".into()));
+        let p = Pending { src, reuse, flow, result };
+        self.notes.remove(&p.key());
+        self.pending = Some(p);
     }
 
     /// Recolhe o resultado de um login que terminou.
     fn poll(&mut self, out: &mut Outcome) {
         let Some(p) = &self.pending else { return };
         let Some(res) = p.result.lock().unwrap().take() else { return };
-        let src = p.src;
+        let (src, reuse, key) = (p.src, p.reuse.clone(), p.key());
         self.pending = None;
         match res {
-            Ok(msg) => {
-                match src {
-                    Source::Outlook => self.cfg.outlook.ativo = true,
-                    Source::Google => self.cfg.google.ativo = true,
-                    Source::ICloud => self.cfg.icloud.ativo = true,
+            Ok(ok) => {
+                let id = self.cfg.upsert_account(src, &ok.who, reuse.as_deref());
+                if let Some(t) = &ok.tokens {
+                    if let Err(e) = t.save(&id) {
+                        self.notes.insert(id, (false, format!("Não consegui gravar o acesso: {e:#}")));
+                        return;
+                    }
                 }
-                self.notes.insert(src, (true, msg));
+                if let Some((apple_id, senha)) = ok.apple {
+                    if let Some(a) = self.cfg.contas.iter_mut().find(|a| a.id == id) {
+                        a.apple_id = apple_id;
+                        a.senha_app = senha;
+                    }
+                    self.icloud_form = false;
+                    self.apple_id.clear();
+                    self.senha_app.clear();
+                }
+                self.notes.remove(&key);
+                self.notes.insert(id, (true, ok.note));
                 out.sync = true;
             }
             Err(e) if e.ends_with("login cancelado") => {
-                self.notes.remove(&src);
+                self.notes.remove(&key);
             }
             Err(e) => {
-                self.notes.insert(src, (false, e));
+                self.notes.insert(key, (false, e));
             }
         }
     }
 
-    pub fn show(&mut self, ui: &mut Ui, pal: &Pal, calendars: &[CalendarInfo]) -> Outcome {
+    pub fn show(&mut self, ui: &mut Ui, pal: &Pal, cache: &Cache) -> Outcome {
         let mut out = Outcome::default();
         self.poll(&mut out);
         let ctx = ui.ctx().clone();
+        let calendars = &cache.calendars;
+
+        // contas antigas (de antes das várias contas) ganham o e-mail na primeira sincronização
+        for a in self.cfg.contas.iter_mut().filter(|a| a.nome.is_empty()) {
+            if let Some(who) = cache.status.get(&a.id).and_then(|s| s.who.clone()).filter(|w| !w.is_empty()) {
+                a.nome = who;
+            }
+        }
 
         // ---- barra do topo ----
         ui.horizontal(|ui| {
@@ -152,45 +205,16 @@ impl Settings {
             ui.spacing_mut().item_spacing.y = 8.0;
 
             section(ui, pal, "Contas");
-            self.account(ui, pal, &ctx, Source::Outlook, "Microsoft 365, Outlook.com e Hotmail");
-            self.account(ui, pal, &ctx, Source::Google, "Google Agenda / Gmail");
-            self.account(ui, pal, &ctx, Source::ICloud, "Agenda do iPhone, iPad e Mac");
+            for acct in self.cfg.contas.clone() {
+                self.account(ui, pal, &ctx, &acct, cache);
+            }
+            self.add_account(ui, pal, &ctx);
 
             section(ui, pal, "Calendário principal");
-            card(ui, pal, |ui| {
-                let writable: Vec<&CalendarInfo> =
-                    calendars.iter().filter(|c| c.writable && providers::enabled(&self.cfg, c.source)).collect();
-                if writable.is_empty() {
-                    hint(ui, pal, "Conecte uma conta e sincronize para escolher onde os eventos novos serão criados.");
-                } else {
-                    let current = self.cfg.principal.as_ref().map(|p| format!("{} · {}", p.name, p.source.label()));
-                    egui::ComboBox::from_id_salt("principal")
-                        .selected_text(current.unwrap_or_else(|| "Escolha…".into()))
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for c in &writable {
-                                let sel = self.cfg.principal.as_ref().is_some_and(|p| p.source == c.source && p.id == c.id);
-                                if ui.selectable_label(sel, format!("{} · {}", c.name, c.source.label())).clicked() {
-                                    self.cfg.principal =
-                                        Some(Principal { source: c.source, id: c.id.clone(), name: c.name.clone() });
-                                }
-                            }
-                        });
-                    hint(ui, pal, "Os eventos criados pelo botão + vão para este calendário.");
-                }
-                // logins antigos (só leitura) precisam conectar de novo para escrever
-                for src in [Source::Outlook, Source::Google] {
-                    if self.connected(src) && !providers::can_write(src) {
-                        let waiting = self.pending.as_ref().is_some_and(|p| p.src == src);
-                        ui.horizontal(|ui| {
-                            hint(ui, pal, &format!("{}: falta permissão para criar eventos.", src.label()));
-                            if ui.add_enabled(!waiting, Button::new("Reconectar")).clicked() {
-                                self.start_login(src, &ctx);
-                            }
-                        });
-                    }
-                }
-            });
+            card(ui, pal, |ui| self.principal_ui(ui, pal, calendars));
+
+            section(ui, pal, "Bloquear horários");
+            card(ui, pal, |ui| self.blocking_ui(ui, pal, calendars));
 
             section(ui, pal, "Linha do tempo");
             card(ui, pal, |ui| {
@@ -283,6 +307,14 @@ impl Settings {
         if self.cfg != self.saved && !dragging {
             match self.cfg.save() {
                 Ok(()) => {
+                    // contas ligadas/desligadas ou bloqueio mudado: aplica já
+                    let toggled = |c: &Config| c.contas.iter().map(|a| (a.id.clone(), a.ativo)).collect::<Vec<_>>();
+                    if self.cfg.bloqueio != self.saved.bloqueio
+                        || self.cfg.principal != self.saved.principal
+                        || toggled(&self.cfg) != toggled(&self.saved)
+                    {
+                        out.sync = true;
+                    }
                     self.saved = self.cfg.clone();
                     out.changed = true;
                 }
@@ -295,29 +327,34 @@ impl Settings {
         out
     }
 
-    fn account(&mut self, ui: &mut Ui, pal: &Pal, ctx: &egui::Context, src: Source, subtitle: &str) {
-        let connected = self.connected(src);
-        let waiting = self.pending.as_ref().is_some_and(|p| p.src == src);
-        let other_busy = self.pending.is_some() && !waiting;
-        let available = match src {
-            Source::Outlook => self.cfg.outlook.client_id().is_some(),
-            Source::Google => self.cfg.google.credentials().is_some(),
-            Source::ICloud => true,
-        };
+    /// Cartão de uma conta conectada.
+    fn account(&mut self, ui: &mut Ui, pal: &Pal, ctx: &egui::Context, acct: &Account, cache: &Cache) {
+        let src = acct.servico;
+        let connected = providers::connected(acct);
+        let waiting = self.pending.as_ref().is_some_and(|p| p.reuse.as_deref() == Some(acct.id.as_str()));
+        let busy = self.pending.is_some();
+        let is_principal = self.cfg.principal.as_ref().is_some_and(|p| p.account == acct.id);
+        let status = cache.status.get(&acct.id);
 
         card(ui, pal, |ui| {
             ui.horizontal(|ui| {
-                let dot = match self.notes.get(&src) {
-                    Some((false, _)) => pal.red,
-                    _ if connected => pal.green,
+                let dot = match (self.notes.get(&acct.id), status) {
+                    (Some((false, _)), _) => pal.red,
+                    _ if !connected => pal.tertiary,
+                    (_, Some(s)) if !s.ok && acct.ativo => pal.red,
+                    _ if acct.ativo => pal.green,
                     _ => pal.tertiary,
                 };
                 let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 ui.painter().circle_filled(r.center(), 4.0, dot);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(RichText::new(src.label()).font(font_named(15.5, MEDIUM)).color(pal.primary));
-                    ui.label(RichText::new(subtitle).font(font(12.0)).color(pal.secondary));
+                    ui.label(RichText::new(self.cfg.account_label(&acct.id)).font(font_named(15.0, MEDIUM)).color(pal.primary));
+                    let mut sub = src.label().to_string();
+                    if is_principal {
+                        sub.push_str(" · principal");
+                    }
+                    ui.label(RichText::new(sub).font(font(12.0)).color(pal.secondary));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if waiting {
@@ -325,39 +362,91 @@ impl Settings {
                             self.cancel();
                         }
                         ui.add(egui::Spinner::new().size(14.0));
-                    } else if connected {
-                        if ui.add_enabled(!other_busy, Button::new("Desconectar")).clicked() {
-                            self.disconnect(src);
+                    } else {
+                        if ui.add_enabled(!busy, Button::new("Desconectar")).clicked() {
+                            self.cfg.remove_account(&acct.id);
+                            self.notes.remove(&acct.id);
                         }
-                    } else if src != Source::ICloud {
-                        let b = Button::new(RichText::new("Conectar").color(Color32::WHITE)).fill(pal_blue(pal));
-                        if ui.add_enabled(available && !other_busy, b).clicked() {
-                            self.start_login(src, ctx);
+                        // OAuth sem tokens (ou sem permissão de escrita): entrar de novo nesta conta
+                        let needs_login = src != Source::ICloud && (!connected || !providers::can_write(acct));
+                        if needs_login && ui.add_enabled(!busy && self.available(src), Button::new("Reconectar")).clicked() {
+                            self.start_login(src, Some(acct.id.clone()), ctx);
                         }
                     }
                 });
             });
 
+            if waiting {
+                self.browser_hint(ui, pal);
+            } else if src != Source::ICloud && !connected {
+                hint(ui, pal, "Sessão perdida: clique em Reconectar.");
+            } else if src != Source::ICloud && !providers::can_write(acct) {
+                hint(ui, pal, "Falta permissão para criar eventos: clique em Reconectar.");
+            }
+
+            if let Some(a) = self.cfg.contas.iter_mut().find(|a| a.id == acct.id) {
+                ui.checkbox(&mut a.ativo, "Mostrar na linha do tempo");
+            }
+            let note = self.notes.get(&acct.id).cloned().or_else(|| {
+                status.filter(|s| !s.ok && acct.ativo).and_then(|s| s.message.clone()).map(|m| (false, m))
+            });
+            if let Some((ok, msg)) = note {
+                ui.label(RichText::new(msg).font(font(12.0)).color(if ok { pal.secondary } else { pal.red }));
+            }
+        });
+    }
+
+    /// Cartão "Adicionar conta": um botão por serviço (pode repetir o serviço).
+    fn add_account(&mut self, ui: &mut Ui, pal: &Pal, ctx: &egui::Context) {
+        let adding = self.pending.as_ref().filter(|p| p.reuse.is_none()).map(|p| p.src);
+        let busy = self.pending.is_some();
+        card(ui, pal, |ui| {
+            ui.label(RichText::new("Adicionar conta").font(font_named(15.0, MEDIUM)).color(pal.primary));
+            ui.horizontal_wrapped(|ui| {
+                for src in [Source::Outlook, Source::Google] {
+                    let b = Button::new(RichText::new(format!("+ {}", src.label())).color(Color32::WHITE)).fill(pal_blue(pal));
+                    if ui.add_enabled(!busy && self.available(src), b).clicked() {
+                        self.start_login(src, None, ctx);
+                    }
+                }
+                let b = Button::new(format!("+ {}", Source::ICloud.label())).selected(self.icloud_form);
+                if ui.add_enabled(!busy, b).clicked() {
+                    self.icloud_form = !self.icloud_form;
+                }
+            });
+
+            if let Some(src) = adding {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label(RichText::new(format!("Entrando no {}…", src.label())).font(font(12.5)).color(pal.secondary));
+                    if ui.button("Cancelar").clicked() {
+                        self.cancel();
+                    }
+                });
+                if src != Source::ICloud {
+                    self.browser_hint(ui, pal);
+                }
+            }
+
             // credenciais do iCloud (a Apple não oferece OAuth para agenda)
-            if src == Source::ICloud && !connected {
-                ui.add_space(4.0);
-                let ic = &mut self.cfg.icloud;
+            if self.icloud_form {
+                let waiting = adding == Some(Source::ICloud);
                 ui.add_enabled(
                     !waiting,
-                    egui::TextEdit::singleline(&mut ic.apple_id).hint_text("Apple ID (voce@icloud.com)").desired_width(f32::INFINITY),
+                    egui::TextEdit::singleline(&mut self.apple_id).hint_text("Apple ID (voce@icloud.com)").desired_width(f32::INFINITY),
                 );
                 ui.add_enabled(
                     !waiting,
-                    egui::TextEdit::singleline(&mut ic.senha_app)
+                    egui::TextEdit::singleline(&mut self.senha_app)
                         .hint_text("Senha de app (xxxx-xxxx-xxxx-xxxx)")
                         .password(true)
                         .desired_width(f32::INFINITY),
                 );
-                let filled = !ic.apple_id.trim().is_empty() && !ic.senha_app.trim().is_empty();
+                let filled = !self.apple_id.trim().is_empty() && !self.senha_app.trim().is_empty();
                 let clicked = ui
                     .horizontal(|ui| {
                         let b = Button::new(RichText::new("Conectar").color(Color32::WHITE)).fill(pal_blue(pal));
-                        let clicked = ui.add_enabled(filled && !waiting && !other_busy, b).clicked();
+                        let clicked = ui.add_enabled(filled && !busy, b).clicked();
                         if ui.link("Criar senha de app ↗").clicked() {
                             let _ = webbrowser::open(APPLE_APP_PASSWORDS);
                         }
@@ -365,44 +454,136 @@ impl Settings {
                     })
                     .inner;
                 if clicked {
-                    self.start_login(src, ctx);
+                    self.start_login(Source::ICloud, None, ctx);
                 }
                 hint(ui, pal, "Em account.apple.com → Entrar e segurança → Senhas de app. A Apple não permite login por navegador para agendas.");
             }
 
-            if waiting && src != Source::ICloud {
-                hint(ui, pal, "Confirme o acesso na janela do navegador que abriu…");
-                let url = self.pending.as_ref().and_then(|p| p.flow.url());
-                if let Some(url) = url {
-                    ui.horizontal(|ui| {
-                        if ui.link("Abrir de novo").clicked() {
-                            let _ = webbrowser::open(&url);
-                        }
-                        if ui.link("Copiar link").clicked() {
-                            ui.ctx().copy_text(url.clone());
-                        }
-                    });
+            for src in Source::ALL {
+                if let Some((ok, msg)) = self.notes.get(&new_key(src)) {
+                    ui.label(RichText::new(msg).font(font(12.0)).color(if *ok { pal.secondary } else { pal.red }));
                 }
             }
-            if !available && src != Source::ICloud && !connected {
-                hint(ui, pal, "Esta versão foi compilada sem o app OAuth deste serviço.");
+            if !self.available(Source::Outlook) || !self.available(Source::Google) {
+                hint(ui, pal, "Esta versão foi compilada sem o app OAuth de algum serviço.");
             }
+            hint(ui, pal, "Dá para conectar várias contas do mesmo serviço (por exemplo, pessoal e trabalho).");
+        });
+    }
 
-            if connected && !waiting {
-                let shown = match src {
-                    Source::Outlook => &mut self.cfg.outlook.ativo,
-                    Source::Google => &mut self.cfg.google.ativo,
-                    Source::ICloud => &mut self.cfg.icloud.ativo,
-                };
-                if src != Source::ICloud {
-                    ui.checkbox(shown, "Mostrar na linha do tempo");
+    /// "Confirme no navegador" + links para abrir de novo / copiar.
+    fn browser_hint(&self, ui: &mut Ui, pal: &Pal) {
+        hint(ui, pal, "Confirme o acesso na janela do navegador que abriu. Para outra conta, troque de conta por lá.");
+        if let Some(url) = self.pending.as_ref().and_then(|p| p.flow.url()) {
+            ui.horizontal(|ui| {
+                if ui.link("Abrir de novo").clicked() {
+                    let _ = webbrowser::open(&url);
                 }
-            }
-            if let Some((ok, msg)) = self.notes.get(&src) {
-                let c = if *ok { pal.secondary } else { pal.red };
-                ui.label(RichText::new(msg).font(font(12.0)).color(c));
+                if ui.link("Copiar link").clicked() {
+                    ui.ctx().copy_text(url.clone());
+                }
+            });
+        }
+    }
+
+    fn principal_ui(&mut self, ui: &mut Ui, pal: &Pal, calendars: &[CalendarInfo]) {
+        let writable: Vec<&CalendarInfo> = calendars.iter().filter(|c| c.writable && self.cfg.active(&c.account)).collect();
+        if writable.is_empty() {
+            hint(ui, pal, "Conecte uma conta e sincronize para escolher onde os eventos novos serão criados.");
+            return;
+        }
+        let label = |cfg: &Config, c: &CalendarInfo| format!("{} · {}", c.name, cfg.account_label(&c.account));
+        let current = self
+            .cfg
+            .principal
+            .as_ref()
+            .map(|p| format!("{} · {}", p.name, self.cfg.account_label(&p.account)))
+            .unwrap_or_else(|| "Escolha…".into());
+        let mut pick = None;
+        egui::ComboBox::from_id_salt("principal").selected_text(current).width(ui.available_width()).show_ui(ui, |ui| {
+            for c in &writable {
+                let sel = self.cfg.principal.as_ref().is_some_and(|p| p.account == c.account && p.id == c.id);
+                if ui.selectable_label(sel, label(&self.cfg, c)).clicked() {
+                    pick = Some(Principal { account: c.account.clone(), source: c.source, id: c.id.clone(), name: c.name.clone() });
+                }
             }
         });
+        if let Some(p) = pick {
+            // o calendário principal não pode ser origem dos próprios bloqueios
+            self.cfg.bloqueio.origens.retain(|o| o.conta != p.account);
+            self.cfg.principal = Some(p);
+        }
+        hint(ui, pal, "Os eventos criados pelo botão + vão para este calendário. Com o bloqueio ligado, é nele que os horários das outras contas são reservados.");
+    }
+
+    fn blocking_ui(&mut self, ui: &mut Ui, pal: &Pal, calendars: &[CalendarInfo]) {
+        let Some(principal) = self.cfg.principal.clone() else {
+            hint(ui, pal, "Escolha um calendário principal para bloquear nele os horários das outras contas.");
+            return;
+        };
+        let mut on = self.cfg.bloqueio.ativo;
+        if ui.checkbox(&mut on, "Bloquear horários das outras contas").changed() {
+            self.cfg.bloqueio.ativo = on;
+            if on && self.cfg.bloqueio.origens.is_empty() {
+                // começa com o calendário padrão de cada outra conta
+                self.cfg.bloqueio.origens = calendars
+                    .iter()
+                    .filter(|c| c.primary && c.account != principal.account && self.cfg.active(&c.account))
+                    .map(|c| CalRef { conta: c.account.clone(), id: c.id.clone() })
+                    .collect();
+            }
+        }
+        hint(
+            ui,
+            pal,
+            &format!(
+                "Para cada compromisso dos calendários marcados abaixo, o Linha cria um evento \"Ocupado\" (particular, sem detalhes e sem lembrete) em {} · {} e o mantém em dia: muda se o original mudar e some se ele for apagado. Eventos de dia inteiro e marcados como disponíveis ficam de fora. Os bloqueios vão até {} dias à frente.",
+                principal.name,
+                self.cfg.account_label(&principal.account),
+                crate::blocks::HORIZON_DAYS
+            ),
+        );
+        if !self.cfg.bloqueio.ativo {
+            return;
+        }
+        if let Some(acct) = self.cfg.account(&principal.account) {
+            if !providers::can_write(acct) {
+                ui.label(
+                    RichText::new("A conta principal não tem permissão para criar eventos: reconecte-a acima.").font(font(12.0)).color(pal.red),
+                );
+            }
+        }
+
+        let others: Vec<&Account> =
+            self.cfg.contas.iter().filter(|a| a.ativo && a.id != principal.account).collect();
+        if others.is_empty() {
+            hint(ui, pal, "Conecte outra conta para ter de onde copiar os horários.");
+            return;
+        }
+        let mut toggles: Vec<(CalRef, bool)> = Vec::new();
+        for acct in others {
+            ui.add_space(2.0);
+            ui.label(RichText::new(self.cfg.account_label(&acct.id)).font(font_named(13.0, MEDIUM)).color(pal.primary));
+            let cals: Vec<&CalendarInfo> = calendars.iter().filter(|c| c.account == acct.id).collect();
+            if cals.is_empty() {
+                hint(ui, pal, "Ainda não sincronizada.");
+            }
+            for c in cals {
+                let r = CalRef { conta: c.account.clone(), id: c.id.clone() };
+                let mut on = self.cfg.bloqueio.origens.contains(&r);
+                let text = if c.primary { format!("{} (padrão)", c.name) } else { c.name.clone() };
+                if ui.checkbox(&mut on, text).changed() {
+                    toggles.push((r, on));
+                }
+            }
+        }
+        for (r, on) in toggles {
+            self.cfg.bloqueio.origens.retain(|x| x != &r);
+            if on {
+                self.cfg.bloqueio.origens.push(r);
+            }
+        }
+        hint(ui, pal, "Marque só calendários seus: agendas de outras pessoas ou feriados bloqueariam horários à toa.");
     }
 }
 

@@ -30,6 +30,11 @@ impl Source {
             Source::ICloud => "icloud",
         }
     }
+
+    /// Aceita a chave (`google`) ou o nome serializado antigo (`Google`).
+    pub fn from_key(s: &str) -> Option<Source> {
+        Source::ALL.into_iter().find(|src| src.key().eq_ignore_ascii_case(s))
+    }
 }
 
 /// Quando o evento acontece.
@@ -54,6 +59,21 @@ pub struct Event {
     /// Página do evento no serviço (para editar no navegador).
     #[serde(default)]
     pub link: Option<String>,
+    /// Conta de onde veio (id em `Config::contas`).
+    #[serde(default)]
+    pub account: String,
+    /// Calendário de onde veio (id no serviço).
+    #[serde(default)]
+    pub calendar_id: String,
+    /// Identificador do evento no serviço (id do Google/Graph, UID no iCloud).
+    #[serde(default)]
+    pub uid: String,
+    /// Marcado como "disponível" (não ocupa horário).
+    #[serde(default)]
+    pub free: bool,
+    /// Bloqueio de horário criado pelo Linha (não aparece na linha do tempo).
+    #[serde(default)]
+    pub block: bool,
 }
 
 impl Event {
@@ -119,12 +139,21 @@ pub struct SyncStatus {
     pub message: Option<String>,
     pub at: Option<DateTime<Utc>>,
     pub count: usize,
+    /// E-mail/dono da conta, como o serviço informou.
+    #[serde(default)]
+    pub who: Option<String>,
 }
 
 /// Um calendário de uma conta conectada.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CalendarInfo {
     pub source: Source,
+    /// Conta dona deste calendário (id em `Config::contas`).
+    #[serde(default)]
+    pub account: String,
+    /// Calendário padrão da conta (Google "primary", Outlook "Calendário").
+    #[serde(default)]
+    pub primary: bool,
     /// Identificador no serviço (id do Graph/Google, URL do CalDAV).
     pub id: String,
     pub name: String,
@@ -164,6 +193,8 @@ pub struct NewEvent {
     pub attendees: Vec<String>,
     /// Gera o link de reunião online com este provedor (`hangoutsMeet`, `teamsForBusiness`…).
     pub online_meeting: Option<String>,
+    /// Bloqueio de horário do Linha: leva uma marca para ser reconhecido depois.
+    pub block: bool,
 }
 
 impl NewEvent {
@@ -305,7 +336,8 @@ pub fn local_tz_name() -> Option<String> {
 pub struct Cache {
     pub updated: Option<DateTime<Utc>>,
     pub events: Vec<Event>,
-    pub status: BTreeMap<Source, SyncStatus>,
+    /// Situação da última sincronização, por conta (id em `Config::contas`).
+    pub status: BTreeMap<String, SyncStatus>,
     /// Calendários vistos na última sincronização de cada conta.
     pub calendars: Vec<CalendarInfo>,
 }
@@ -313,10 +345,22 @@ pub struct Cache {
 impl Cache {
     pub fn load() -> Cache {
         let path = crate::store::cache_path();
-        std::fs::read_to_string(path)
+        let mut cache: Cache = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // cache de antes das várias contas: cada serviço tinha uma só, com id = nome do serviço
+        for e in cache.events.iter_mut().filter(|e| e.account.is_empty()) {
+            e.account = e.source.key().to_string();
+        }
+        for c in cache.calendars.iter_mut().filter(|c| c.account.is_empty()) {
+            c.account = c.source.key().to_string();
+        }
+        cache.status = std::mem::take(&mut cache.status)
+            .into_iter()
+            .map(|(k, v)| (Source::from_key(&k).map(|s| s.key().to_string()).unwrap_or(k), v))
+            .collect();
+        cache
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -326,7 +370,8 @@ impl Cache {
 
     /// Eventos do dia, ordenados: dia inteiro primeiro, depois por início.
     pub fn events_on(&self, day: NaiveDate) -> Vec<Event> {
-        let mut v: Vec<Event> = self.events.iter().filter(|e| e.touches_day(day)).cloned().collect();
+        // bloqueios do Linha repetem eventos que já aparecem pela conta de origem
+        let mut v: Vec<Event> = self.events.iter().filter(|e| !e.block && e.touches_day(day)).cloned().collect();
         v.sort_by(|a, b| {
             b.is_all_day()
                 .cmp(&a.is_all_day())
